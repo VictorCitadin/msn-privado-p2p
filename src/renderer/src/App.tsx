@@ -301,11 +301,15 @@ const MainMsnMessengerWindow: React.FC = () => {
   ])
 
   // Ajusta o volume do filme/tela compartilhada (0% a 100%) e da voz do amigo
+  // Além disso, silencia o áudio da tela compartilhada enquanto o DJ Bot estiver tocando para nunca tocar a música 2x!
   useEffect(() => {
+    webrtcRef.current?.setDjBotPlayingState(djState.isPlaying)
     if (remoteScreenVideoRef.current) {
-      remoteScreenVideoRef.current.volume = Math.max(0, Math.min(1, screenMovieVolume / 100))
+      remoteScreenVideoRef.current.volume = djState.isPlaying
+        ? 0
+        : Math.max(0, Math.min(1, screenMovieVolume / 100))
     }
-  }, [screenMovieVolume, isScreenSharing, remoteScreenSharing])
+  }, [screenMovieVolume, isScreenSharing, remoteScreenSharing, djState.isPlaying])
 
   useEffect(() => {
     if (remoteVoiceAudioRef.current) {
@@ -1340,14 +1344,14 @@ const MainMsnMessengerWindow: React.FC = () => {
             /* ================================================================ */
             /* TELA 3: LIGAÇÃO DE VÍDEO (1x1)                                   */
             /* ================================================================ */
-            <div className="relative w-full h-full bg-slate-950 overflow-hidden">
-              {/* Câmera do Amigo ocupando 100% da área principal (w-full h-full object-cover) */}
+            <div className="relative w-full h-full bg-slate-950 overflow-hidden flex items-center justify-center">
+              {/* Câmera do Amigo em proporção natural 16:9 Widescreen sem zoom/corte (object-contain) */}
               <video
                 ref={remoteCamVideoRef}
                 autoPlay
                 playsInline
                 muted
-                className="w-full h-full object-cover"
+                className="w-full h-full object-contain bg-slate-950"
               />
 
               {/* Minha Câmera flutuando no canto inferior direito: quadrada (aspect-square w-40 h-40) com cantos arredondados (rounded-2xl) */}

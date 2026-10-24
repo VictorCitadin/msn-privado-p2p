@@ -304,8 +304,16 @@ function ensureDjPlayerWindow(): BrowserWindow {
               if (skipBtn) skipBtn.click();
 
               const adShowing = Boolean(document.querySelector('.ad-showing'));
-              const v = document.querySelector('video');
+              const v = document.querySelector('#movie_player video.html5-main-video') || document.querySelector('video');
               if (!v) return null;
+
+              // Garante que qualquer outro elemento <video> ou <audio> secundário na página do YouTube fique 100% pausado/mutado
+              document.querySelectorAll('video, audio').forEach((el) => {
+                if (el !== v) {
+                  el.muted = true;
+                  try { el.pause(); } catch {}
+                }
+              });
 
               if (adShowing && Number.isFinite(v.duration) && v.duration > 0) {
                 v.currentTime = v.duration;
@@ -1187,26 +1195,40 @@ function setupAutoUpdater(): void {
 }
 
 // ============================================================================
-// 11. CICLO DE VIDA DO APP ELECTRON
+// 11. CICLO DE VIDA DO APP ELECTRON (COM SINGLE INSTANCE LOCK)
 // ============================================================================
-app.whenReady().then(() => {
-  electronApp.setAppUserModelId('com.vitinhowill.msnprivadop2p')
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
 
-  app.on('browser-window-created', (_, window) => {
-    optimizer.watchWindowShortcuts(window)
+if (!gotSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      if (!mainWindow.isVisible()) mainWindow.show()
+      mainWindow.focus()
+    }
   })
 
-  configureYouTubeHeaders()
-  registerIpcHandlers()
-  setupAutoUpdater()
-  createMainWindow()
-  setupSystemTray()
-  registerGlobalShortcuts()
+  app.whenReady().then(() => {
+    electronApp.setAppUserModelId('com.vitinhowill.msnprivadop2p')
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createMainWindow()
+    app.on('browser-window-created', (_, window) => {
+      optimizer.watchWindowShortcuts(window)
+    })
+
+    configureYouTubeHeaders()
+    registerIpcHandlers()
+    setupAutoUpdater()
+    createMainWindow()
+    setupSystemTray()
+    registerGlobalShortcuts()
+
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createMainWindow()
+    })
   })
-})
+}
 
 app.on('before-quit', () => {
   isQuitting = true

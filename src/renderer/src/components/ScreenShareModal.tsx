@@ -16,7 +16,7 @@ export const ScreenShareModal: React.FC<ScreenShareModalProps> = ({
   const [sources, setSources] = useState<DesktopSourceItem[]>([])
   const [selectedId, setSelectedId] = useState<string>('')
   const [filterTab, setFilterTab] = useState<'all' | 'screen' | 'window'>('all')
-  const [includeAudio, setIncludeAudio] = useState<boolean>(true)
+  const [includeAudio, setIncludeAudio] = useState<boolean>(false)
   const [loading, setLoading] = useState<boolean>(false)
 
   const loadSources = async (): Promise<void> => {

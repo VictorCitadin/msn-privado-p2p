@@ -223,6 +223,8 @@ export class MsnWebRTCService {
   private localAnalyser: AnalyserNode | null = null
   private remoteAnalyser: AnalyserNode | null = null
   private silenceTimeout: ReturnType<typeof setTimeout> | null = null
+  private screenEchoGateTimeout: ReturnType<typeof setTimeout> | null = null
+  private djBotPlaying = false
   private currentlySpeaking = false
 
   // Buffer de recepção de arquivos P2P
@@ -619,14 +621,15 @@ export class MsnWebRTCService {
       }
     }
 
-    // 2. Track da Webcam em MediaStream separado (com try/catch individual caso não tenha webcam ou esteja em uso)
+    // 2. Track da Webcam em MediaStream separado em 16:9 Widescreen HD (sem zoom/corte quadrado)
     if (withVideo && !this.localCamStream) {
       try {
         const isCompact = this.ecoMode || Boolean(this.localScreenStream)
         this.localCamStream = await navigator.mediaDevices.getUserMedia({
           video: {
-            width: { ideal: isCompact ? 320 : 640 },
-            height: { ideal: isCompact ? 320 : 640 },
+            width: { ideal: isCompact ? 640 : 1280 },
+            height: { ideal: isCompact ? 360 : 720 },
+            aspectRatio: { ideal: 16 / 9 },
             frameRate: { ideal: isCompact ? 24 : 30 }
           },
           audio: false
@@ -800,13 +803,13 @@ export class MsnWebRTCService {
       }
     }
 
-    // Desativa processamentos de voz na track de áudio da tela (fidelidade total de som estéreo)
+    // Ativa echoCancellation na track de áudio da tela para o AEC3 do Chromium subtrair a voz do amigo
     const screenAudioTrack = rawDesktopStream.getAudioTracks()[0]
     if (screenAudioTrack) {
       await screenAudioTrack
         .applyConstraints({
-          echoCancellation: false,
-          noiseSuppression: false,
+          echoCancellation: true,
+          noiseSuppression: true,
           autoGainControl: false
         })
         .catch(() => {})
@@ -877,8 +880,9 @@ export class MsnWebRTCService {
 
     try {
       await camTrack.applyConstraints({
-        width: { ideal: compactMode ? 320 : 640 },
-        height: { ideal: compactMode ? 320 : 640 },
+        width: { ideal: compactMode ? 640 : 1280 },
+        height: { ideal: compactMode ? 360 : 720 },
+        aspectRatio: { ideal: 16 / 9 },
         frameRate: { ideal: compactMode ? 24 : 30 }
       })
     } catch (err) {
@@ -1148,8 +1152,33 @@ export class MsnWebRTCService {
   }
 
   /**
-   * Loop leve de detecção de atividade de voz (Auto-Ducking: reduz DJ Bot em 70% quando alguém fala,
-   * retornando ao volume normal 800ms após o silêncio)
+   * Informa ao motor WebRTC se o DJ Bot está tocando.
+   * Quando o DJ Bot está tocando, o áudio do compartilhamento de tela é silenciado na origem
+   * para nunca transmitir uma 2ª cópia atrasada da música para o amigo!
+   */
+  public setDjBotPlayingState(isPlaying: boolean): void {
+    this.djBotPlaying = isPlaying
+    this.updateScreenAudioLoopbackGate(false)
+  }
+
+  private updateScreenAudioLoopbackGate(remoteFriendSpeaking: boolean): void {
+    const screenAudioTrack = this.localScreenStream?.getAudioTracks()[0]
+    if (!screenAudioTrack) return
+
+    // Se o DJ Bot estiver tocando OU se o amigo remoto estiver falando agora,
+    // corta a transmissão do loopback do sistema para não devolver a voz do amigo nem duplicar o DJ Bot!
+    if (this.djBotPlaying || remoteFriendSpeaking) {
+      screenAudioTrack.enabled = false
+    } else {
+      screenAudioTrack.enabled = true
+    }
+  }
+
+  /**
+   * Loop rápido (60ms) de detecção de atividade de voz:
+   * 1. Auto-Ducking: reduz DJ Bot em 70% quando alguém fala e restaura 800ms após o silêncio.
+   * 2. Anti-Echo Gate: quando o amigo fala, silencia temporariamente o loopback de áudio da tela compartilhada
+   *    para que a voz do amigo que sai no seu fone/caixa nunca volte duplicada para ele!
    */
   private startVoiceActivityLoop(): void {
     if (this.vadInterval) return
@@ -1170,7 +1199,22 @@ export class MsnWebRTCService {
       const localLevel = localMicEnabled ? computeRms(this.localAnalyser) : 0
       const remoteLevel = computeRms(this.remoteAnalyser)
 
-      const speakingNow = localLevel > 24 || remoteLevel > 24
+      // Anti-Echo Gate para compartilhamento de tela: se o amigo está falando (remoteLevel > 10),
+      // bloqueia o loopback de áudio do sistema imediatamente e libera 350ms após ele parar de falar
+      if (remoteLevel > 10) {
+        if (this.screenEchoGateTimeout) {
+          clearTimeout(this.screenEchoGateTimeout)
+          this.screenEchoGateTimeout = null
+        }
+        this.updateScreenAudioLoopbackGate(true)
+      } else if (!this.screenEchoGateTimeout) {
+        this.screenEchoGateTimeout = setTimeout(() => {
+          this.screenEchoGateTimeout = null
+          this.updateScreenAudioLoopbackGate(false)
+        }, 350)
+      }
+
+      const speakingNow = localLevel > 22 || remoteLevel > 22
 
       if (speakingNow) {
         if (this.silenceTimeout) {
@@ -1189,7 +1233,7 @@ export class MsnWebRTCService {
           this.callbacks.onVoiceActivityChange(false)
         }, 800)
       }
-    }, 120)
+    }, 60)
   }
 
   // ==========================================================================

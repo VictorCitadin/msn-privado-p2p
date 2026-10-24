@@ -1,6 +1,6 @@
 {
   "name": "msn-privado-p2p",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "MSN Messenger Privado P2P + WMP DJ Bot + Album Ranker (Ultra-Lightweight Gaming Edition) para Vitinho e Will",
   "main": "./out/main/index.js",
   "author": "Vitinho & Will",
