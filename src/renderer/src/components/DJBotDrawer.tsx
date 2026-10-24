@@ -39,6 +39,9 @@ export const DJBotDrawer: React.FC<DJBotDrawerProps> = ({
   const [baseVolume, setBaseVolume] = useState<number>(75)
   const [progressSec, setProgressSec] = useState<number>(0)
   const [liveDurationSec, setLiveDurationSec] = useState<number>(0)
+  const [autoDucking, setAutoDucking] = useState<boolean>(() => {
+    return localStorage.getItem('msn_dj_auto_ducking') === 'true'
+  })
 
   const djStateRef = useRef<DjSyncState>(djState)
   djStateRef.current = djState
@@ -46,6 +49,14 @@ export const DJBotDrawer: React.FC<DJBotDrawerProps> = ({
 
   const currentTrack: DjTrackItem | null =
     djState.playlist[djState.currentIndex] || null
+
+  const handleToggleAutoDucking = (): void => {
+    setAutoDucking((prev) => {
+      const next = !prev
+      localStorage.setItem('msn_dj_auto_ducking', String(next))
+      return next
+    })
+  }
 
   // 1. Escuta o progresso de tempo real (00:01, 00:02...) vindo do motor nativo no processo Main
   useEffect(() => {
@@ -81,11 +92,10 @@ export const DJBotDrawer: React.FC<DJBotDrawerProps> = ({
     return () => unsub()
   }, [currentUser, onUpdateDjState])
 
-  // 2. Sincroniza a música atual, play/pause, seek e Auto-Ducking (-70%) com o motor no Main
+  // 2. Sincroniza a música atual, play/pause, seek e Auto-Ducking (-70%) opcional com o motor no Main
   useEffect(() => {
-    const effectiveVolume = isAnyoneSpeaking
-      ? Math.round(baseVolume * 0.3)
-      : baseVolume
+    const effectiveVolume =
+      autoDucking && isAnyoneSpeaking ? Math.round(baseVolume * 0.3) : baseVolume
 
     window.msnApi.syncDjPlayer({
       videoId: currentTrack ? currentTrack.videoId : null,
@@ -106,7 +116,8 @@ export const DJBotDrawer: React.FC<DJBotDrawerProps> = ({
     djState.currentIndex,
     djState.updatedAt,
     baseVolume,
-    isAnyoneSpeaking
+    isAnyoneSpeaking,
+    autoDucking
   ])
 
   // Adicionar música por nome, link do YouTube ou link do Spotify
@@ -297,7 +308,7 @@ export const DJBotDrawer: React.FC<DJBotDrawerProps> = ({
               ))}
             </div>
 
-            {isAnyoneSpeaking && (
+            {autoDucking && isAnyoneSpeaking && (
               <span className="ml-2 px-1.5 py-0.5 rounded bg-amber-500/20 border border-amber-400 text-amber-300 text-[9px] font-bold whitespace-nowrap">
                 🔉 AUTO-DUCK -70%
               </span>
@@ -358,8 +369,27 @@ export const DJBotDrawer: React.FC<DJBotDrawerProps> = ({
             className="w-full accent-[#76ff03] h-1.5 bg-slate-700 rounded cursor-pointer"
           />
           <span className="text-[11px] font-wmp text-[#76ff03] w-9 text-right">
-            {isAnyoneSpeaking ? `${Math.round(baseVolume * 0.3)}%` : `${baseVolume}%`}
+            {autoDucking && isAnyoneSpeaking
+              ? `${Math.round(baseVolume * 0.3)}%`
+              : `${baseVolume}%`}
           </span>
+        </div>
+
+        {/* Opção de Ligar/Desligar Auto-Ducking */}
+        <div className="flex items-center justify-between px-1 pt-1 border-t border-slate-700/50">
+          <span className="text-[10px] text-slate-400">Abaixar som ao falar:</span>
+          <button
+            type="button"
+            onClick={handleToggleAutoDucking}
+            className={`px-2 py-0.5 rounded text-[10px] font-bold border transition-colors ${
+              autoDucking
+                ? 'bg-amber-500/20 border-amber-400 text-amber-300'
+                : 'bg-slate-700/60 border-slate-600 text-slate-400 hover:text-white'
+            }`}
+            title="Quando ligado, reduz a música em 70% automaticamente enquanto você ou seu amigo estiverem falando"
+          >
+            {autoDucking ? 'LIGADO (-70%)' : 'DESLIGADO'}
+          </button>
         </div>
       </div>
 

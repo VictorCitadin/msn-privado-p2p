@@ -157,6 +157,16 @@ const MainMsnMessengerWindow: React.FC = () => {
   const [ecoMode, setEcoMode] = useState<boolean>(false)
   const [isWindowVisible, setIsWindowVisible] = useState<boolean>(true)
   const [isCallFullscreen, setIsCallFullscreen] = useState<boolean>(false)
+  const [nudgeCooldown, setNudgeCooldown] = useState<number>(0)
+
+  // Cooldown de 5 segundos para Chamar Atenção (Nudge)
+  useEffect(() => {
+    if (nudgeCooldown <= 0) return
+    const timer = setInterval(() => {
+      setNudgeCooldown((prev) => Math.max(0, prev - 1))
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [nudgeCooldown])
 
   // Mixers Independentes: Voz do Amigo (0% a 200% Boost) e Volume do Filme/Tela (0% a 100%)
   const [friendVoiceVolume, setFriendVoiceVolume] = useState<number>(100)
@@ -590,6 +600,8 @@ const MainMsnMessengerWindow: React.FC = () => {
         setRemoteScreenSharing(state.remoteScreenSharing)
         if (!state.inCall) {
           setRoomViewActive(false)
+          setIsScreenSharing(false)
+          setRemoteScreenSharing(false)
         }
         soundManager.stopRingLoop()
       },
@@ -771,9 +783,10 @@ const MainMsnMessengerWindow: React.FC = () => {
     }
   }
 
-  // Chamar Atenção (Nudge): toca nudge.mp3 + treme a janela física do Electron por 600ms
+  // Chamar Atenção (Nudge): toca nudge.mp3 + treme a janela física do Electron por 600ms com cooldown de 5s
   const handleTriggerNudge = (): void => {
-    if (!loggedInUser || !webrtcRef.current) return
+    if (!loggedInUser || !webrtcRef.current || nudgeCooldown > 0) return
+    setNudgeCooldown(5)
     soundManager.play('nudge')
     window.msnApi.nudgeWindow()
     webrtcRef.current.sendNudge()
@@ -1285,6 +1298,8 @@ const MainMsnMessengerWindow: React.FC = () => {
             onClick={() => {
               if (inCall) {
                 setRoomViewActive(false)
+                setIsScreenSharing(false)
+                setRemoteScreenSharing(false)
                 webrtcRef.current?.rejectOrHangupCall()
               } else {
                 setRoomViewActive(true)
@@ -1344,14 +1359,16 @@ const MainMsnMessengerWindow: React.FC = () => {
             <span>{isScreenSharing ? 'Parar Tela' : 'Compartilhar Tela'}</span>
           </button>
 
-          {/* 3. Chamar Atenção (Nudge) */}
+          {/* 3. Chamar Atenção (Nudge) com Cooldown de 5s */}
           <button
             type="button"
             onClick={handleTriggerNudge}
-            className="msn-btn-aero px-2.5 py-1.5 rounded-lg text-xs font-bold text-[#164273] flex items-center gap-1.5"
+            disabled={nudgeCooldown > 0}
+            className="msn-btn-aero px-2.5 py-1.5 rounded-lg text-xs font-bold text-[#164273] flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+            title={nudgeCooldown > 0 ? `Aguarde ${nudgeCooldown}s para chamar atenção novamente` : 'Chamar Atenção (Nudge)'}
           >
             <BellRing className="w-4 h-4 text-amber-600" />
-            <span>Chamar Atenção (Nudge)</span>
+            <span>{nudgeCooldown > 0 ? `Chamar Atenção (${nudgeCooldown}s)` : 'Chamar Atenção (Nudge)'}</span>
           </button>
 
           {/* 4. DJ Bot (Expande a gaveta lateral na mesma janela) */}
@@ -1725,6 +1742,8 @@ const MainMsnMessengerWindow: React.FC = () => {
                     type="button"
                     onClick={() => {
                       setRoomViewActive(false)
+                      setIsScreenSharing(false)
+                      setRemoteScreenSharing(false)
                       webrtcRef.current?.rejectOrHangupCall()
                     }}
                     className="px-3.5 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold flex items-center gap-1.5"
@@ -1930,6 +1949,8 @@ const MainMsnMessengerWindow: React.FC = () => {
                   type="button"
                   onClick={() => {
                     setRoomViewActive(false)
+                    setIsScreenSharing(false)
+                    setRemoteScreenSharing(false)
                     webrtcRef.current?.rejectOrHangupCall()
                   }}
                   className="px-3.5 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold flex items-center gap-1.5"

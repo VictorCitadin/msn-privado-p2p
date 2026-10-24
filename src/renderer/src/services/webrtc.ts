@@ -250,11 +250,28 @@ export class MsnWebRTCService {
   // Buffer de recepção de arquivos P2P
   private incomingFiles: Map<string, IncomingFileBuffer> = new Map()
 
+  // Reconexão Automática P2P (ICE Restart) & Rede
+  private reconnectTimeout: ReturnType<typeof setTimeout> | null = null
+  private isReconnecting = false
+  private onlineHandler: (() => void) | null = null
+
   constructor(myUser: MsnUser, callbacks: WebRTCCallbacks) {
     this.myUser = myUser
     this.friendUser = myUser === 'Vitinho' ? 'Will' : 'Vitinho'
     this.callbacks = callbacks
     this.initSignaling()
+    this.setupOnlineListener()
+  }
+
+  private setupOnlineListener(): void {
+    this.onlineHandler = () => {
+      console.log('[WebRTC] Conexão com a rede reestabelecida. Sincronizando presença e verificando P2P...')
+      this.trackPresenceState()
+      if (this.inCall || this.friendInRoom) {
+        this.handleConnectionFailure()
+      }
+    }
+    window.addEventListener('online', this.onlineHandler)
   }
 
   // ==========================================================================
@@ -406,7 +423,9 @@ export class MsnWebRTCService {
   // 3. CRIAÇÃO DO RTCPeerConnection E SEPARAÇÃO DE TRACKS
   // ==========================================================================
   private ensurePeerConnection(): RTCPeerConnection {
-    if (this.peerConnection) return this.peerConnection
+    if (this.peerConnection && this.peerConnection.signalingState !== 'closed') {
+      return this.peerConnection
+    }
 
     const pc = new RTCPeerConnection({
       iceServers: this.getIceServers(),
@@ -432,23 +451,22 @@ export class MsnWebRTCService {
 
       const routeTrack = (): void => {
         if (track.kind === 'audio') {
-          const hasExistingLiveMic = Boolean(
-            this.remoteVoiceStream &&
-              this.remoteVoiceStream
-                .getAudioTracks()
-                .some((t) => t.readyState === 'live' && t.id !== track.id)
+          const isExplicitScreenAudio = Boolean(
+            this.remoteStreamIds.screenStreamId &&
+              stream.id === this.remoteStreamIds.screenStreamId
           )
+          const isExplicitMic = Boolean(
+            this.remoteStreamIds.micStreamId &&
+              stream.id === this.remoteStreamIds.micStreamId
+          )
+          const audioLabel = track.label.toLowerCase()
+          const isScreenAudioLabel =
+            audioLabel.includes('screen') ||
+            audioLabel.includes('system') ||
+            audioLabel.includes('loopback') ||
+            audioLabel.includes('desktop')
 
-          const isScreenAudio =
-            (this.remoteStreamIds.screenStreamId &&
-              stream.id === this.remoteStreamIds.screenStreamId) ||
-            (this.remoteStreamIds.micStreamId &&
-              stream.id !== this.remoteStreamIds.micStreamId &&
-              hasExistingLiveMic) ||
-            hasExistingLiveMic ||
-            track.label.toLowerCase().includes('screen') ||
-            track.label.toLowerCase().includes('system') ||
-            track.label.toLowerCase().includes('loopback')
+          const isScreenAudio = !isExplicitMic && (isExplicitScreenAudio || isScreenAudioLabel)
 
           if (isScreenAudio) {
             if (!this.remoteScreenStream) {
@@ -458,27 +476,36 @@ export class MsnWebRTCService {
               this.remoteScreenStream.addTrack(track)
             }
           } else {
+            if (this.remoteVoiceStream) {
+              this.remoteVoiceStream.getAudioTracks().forEach((oldTrack) => {
+                if (oldTrack.id !== track.id) {
+                  try {
+                    oldTrack.stop()
+                  } catch {}
+                }
+              })
+            }
             this.remoteVoiceStream = new MediaStream([track])
             this.setupRemoteVoiceAnalyser(this.remoteVoiceStream)
           }
         } else if (track.kind === 'video') {
-          const hasExistingLiveCam = Boolean(
-            this.remoteCamStream &&
-              this.remoteCamStream
-                .getVideoTracks()
-                .some((t) => t.readyState === 'live' && t.id !== track.id)
+          const isExplicitScreenId = Boolean(
+            this.remoteStreamIds.screenStreamId &&
+              stream.id === this.remoteStreamIds.screenStreamId
           )
+          const isExplicitCamId = Boolean(
+            this.remoteStreamIds.camStreamId &&
+              stream.id === this.remoteStreamIds.camStreamId
+          )
+          const labelLower = track.label.toLowerCase()
+          const isExplicitScreenLabel =
+            labelLower.includes('screen') ||
+            labelLower.includes('window') ||
+            labelLower.includes('display') ||
+            labelLower.includes('desktop')
 
-          const isScreenVideo =
-            (this.remoteStreamIds.screenStreamId &&
-              stream.id === this.remoteStreamIds.screenStreamId) ||
-            (this.remoteStreamIds.camStreamId &&
-              stream.id !== this.remoteStreamIds.camStreamId &&
-              hasExistingLiveCam) ||
-            hasExistingLiveCam ||
-            track.label.toLowerCase().includes('screen') ||
-            track.label.toLowerCase().includes('window') ||
-            track.label.toLowerCase().includes('display')
+          // Vídeo só é tratado como tela se for explicitamente tela, NUNCA por suposição
+          const isScreenVideo = !isExplicitCamId && (isExplicitScreenId || isExplicitScreenLabel)
 
           if (isScreenVideo) {
             if (!this.remoteScreenStream) {
@@ -487,11 +514,26 @@ export class MsnWebRTCService {
             this.remoteScreenStream
               .getVideoTracks()
               .filter((t) => t.id !== track.id)
-              .forEach((t) => this.remoteScreenStream?.removeTrack(t))
+              .forEach((t) => {
+                try {
+                  t.stop()
+                } catch {}
+                this.remoteScreenStream?.removeTrack(t)
+              })
             if (!this.remoteScreenStream.getVideoTracks().some((t) => t.id === track.id)) {
               this.remoteScreenStream.addTrack(track)
             }
           } else {
+            // Webcam normal do amigo: substitui qualquer track de câmera velha para nunca duplicar
+            if (this.remoteCamStream) {
+              this.remoteCamStream.getVideoTracks().forEach((oldTrack) => {
+                if (oldTrack.id !== track.id) {
+                  try {
+                    oldTrack.stop()
+                  } catch {}
+                }
+              })
+            }
             this.remoteCamStream = new MediaStream([track])
           }
         }
@@ -504,11 +546,65 @@ export class MsnWebRTCService {
       track.onunmute = () => {
         routeTrack()
       }
+
+      track.onended = () => {
+        if (track.kind === 'video') {
+          if (
+            this.remoteScreenStream &&
+            this.remoteScreenStream.getVideoTracks().some((t) => t.id === track.id)
+          ) {
+            this.remoteScreenStream.removeTrack(track)
+            if (this.remoteScreenStream.getVideoTracks().length === 0) {
+              this.remoteScreenStream = null
+            }
+            this.emitStreamsUpdated()
+            this.emitCallState()
+          }
+          if (
+            this.remoteCamStream &&
+            this.remoteCamStream.getVideoTracks().some((t) => t.id === track.id)
+          ) {
+            this.remoteCamStream.removeTrack(track)
+            if (this.remoteCamStream.getVideoTracks().length === 0) {
+              this.remoteCamStream = null
+            }
+            this.emitStreamsUpdated()
+            this.emitCallState()
+          }
+        } else if (track.kind === 'audio') {
+          if (
+            this.remoteScreenStream &&
+            this.remoteScreenStream.getAudioTracks().some((t) => t.id === track.id)
+          ) {
+            this.remoteScreenStream.removeTrack(track)
+          }
+          if (
+            this.remoteVoiceStream &&
+            this.remoteVoiceStream.getAudioTracks().some((t) => t.id === track.id)
+          ) {
+            this.remoteVoiceStream.removeTrack(track)
+            if (this.remoteVoiceStream.getAudioTracks().length === 0) {
+              this.remoteVoiceStream = null
+            }
+            this.emitStreamsUpdated()
+            this.emitCallState()
+          }
+        }
+      }
+    }
+
+    pc.oniceconnectionstatechange = () => {
+      console.log('[WebRTC] ICE Connection State:', pc.iceConnectionState)
+      if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+        this.handleConnectionFailure()
+      }
     }
 
     pc.onconnectionstatechange = () => {
+      console.log('[WebRTC] Peer Connection State:', pc.connectionState)
       if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
         this.emitCallState()
+        this.handleConnectionFailure()
       }
     }
 
@@ -895,14 +991,19 @@ export class MsnWebRTCService {
     this.pendingOffer = null
     this.incomingCallFrom = null
     this.setRemoteVoiceBoostVolume(this.remoteVoiceVolumePercent)
-    this.cleanupLocalMediaStreams()
+    this.cleanupMediaStreams()
+    this.remoteStreamIds = {
+      micStreamId: null,
+      camStreamId: null,
+      screenStreamId: null
+    }
     this.trackPresenceState()
     this.sendDataChannelPacket({
       type: 'room-state',
       sender: this.myUser,
       inRoom: false
     })
-    this.sendSignal('hangup', { inRoom: false })
+    this.sendSignal('hangup', { inRoom: false }).catch(() => {})
     this.emitStreamsUpdated()
     this.emitCallState()
   }
@@ -1081,7 +1182,13 @@ export class MsnWebRTCService {
   }
 
   private async renegotiatePeerConnection(): Promise<void> {
-    if (!this.peerConnection) return
+    if (!this.peerConnection || this.peerConnection.signalingState === 'closed') return
+    if (this.peerConnection.signalingState !== 'stable') {
+      console.warn(
+        `[WebRTC] Sinalização não está estável (${this.peerConnection.signalingState}), postergando renegociação`
+      )
+      return
+    }
     this.broadcastStreamMeta()
     const offer = await this.peerConnection.createOffer({
       offerToReceiveAudio: true,
@@ -1093,6 +1200,73 @@ export class MsnWebRTCService {
       inRoom: this.inCall,
       streamIds: this.getLocalStreamIds()
     })
+  }
+
+  private handleConnectionFailure(): void {
+    if (this.reconnectTimeout) return
+    this.reconnectTimeout = setTimeout(() => {
+      this.reconnectTimeout = null
+      this.triggerAutoReconnect().catch((err) => {
+        console.warn('[WebRTC] Falha na reconexão automática:', err)
+      })
+    }, 1200)
+  }
+
+  private async triggerAutoReconnect(): Promise<void> {
+    if (!this.inCall && !this.friendInRoom) return
+    if (this.isReconnecting) return
+    this.isReconnecting = true
+    console.log('[WebRTC] Executando reconexão automática P2P via ICE Restart...')
+
+    try {
+      if (
+        this.peerConnection &&
+        this.peerConnection.signalingState !== 'closed' &&
+        this.peerConnection.connectionState !== 'closed'
+      ) {
+        const offer = await this.peerConnection.createOffer({
+          iceRestart: true,
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: true
+        })
+        await this.setLocalDescriptionSafe(this.peerConnection, offer)
+        await this.sendSignal('renegotiate-offer', {
+          sdp: this.peerConnection.localDescription,
+          inRoom: this.inCall,
+          streamIds: this.getLocalStreamIds(),
+          isIceRestart: true
+        })
+        console.log('[WebRTC] ICE Restart offer enviado com sucesso!')
+      } else if (this.inCall) {
+        console.log('[WebRTC] RTCPeerConnection inoperante, reconstruindo do zero...')
+        this.resetPeerConnection()
+        await this.startCall(Boolean(this.localCamStream))
+      }
+    } catch (err) {
+      console.warn('[WebRTC] Falha no ICE restart rápido, recriando conexão completa:', err)
+      if (this.inCall) {
+        this.resetPeerConnection()
+        await this.startCall(Boolean(this.localCamStream))
+      }
+    } finally {
+      this.isReconnecting = false
+    }
+  }
+
+  private resetPeerConnection(): void {
+    if (this.peerConnection) {
+      this.peerConnection.ontrack = null
+      this.peerConnection.onicecandidate = null
+      this.peerConnection.oniceconnectionstatechange = null
+      this.peerConnection.onconnectionstatechange = null
+      this.peerConnection.onsignalingstatechange = null
+      try {
+        this.peerConnection.close()
+      } catch {}
+      this.peerConnection = null
+    }
+    this.dataChannel = null
+    this.pendingIceCandidates = []
   }
 
   private getLocalStreamIds(): {
@@ -1153,9 +1327,23 @@ export class MsnWebRTCService {
       }
 
       // Na Sala Sempre Existente: aceita automaticamente a oferta WebRTC!
-      // Se ainda não entramos na Sala (!this.inCall), recebemos a webcam do amigo no quadrado do Chat (com voz silenciada até entrarmos).
-      // Se já estamos na Sala (this.inCall), anexamos nossas tracks locais em sendrecv e conversamos imediatamente!
       const pc = this.ensurePeerConnection()
+      const isPolite = this.myUser === 'Vitinho'
+      const offerCollision = pc.signalingState !== 'stable'
+
+      if (offerCollision) {
+        if (!isPolite) {
+          console.warn('[WebRTC] Colisão de oferta evitada: peer impolítico ignorando oferta concorrente')
+          return
+        }
+        console.log('[WebRTC] Colisão de oferta: peer político realizando rollback...')
+        try {
+          await pc.setLocalDescription({ type: 'rollback' })
+        } catch (err) {
+          console.warn('[WebRTC] Erro no rollback:', err)
+        }
+      }
+
       if (this.inCall) {
         this.attachLocalStreamsToPeer(pc)
       }
@@ -1174,20 +1362,12 @@ export class MsnWebRTCService {
       })
       this.emitStreamsUpdated()
       this.emitCallState()
-
-      if (this.inCall && type === 'sdp-offer') {
-        setTimeout(() => {
-          if (this.inCall && this.peerConnection?.signalingState === 'stable') {
-            this.renegotiatePeerConnection().catch(() => {})
-          }
-        }, 500)
-      }
       return
     }
 
     if (type === 'sdp-answer') {
       const sdp = data.sdp as RTCSessionDescriptionInit
-      if (this.peerConnection && this.peerConnection.signalingState !== 'stable') {
+      if (this.peerConnection && this.peerConnection.signalingState === 'have-local-offer') {
         await this.peerConnection.setRemoteDescription(new RTCSessionDescription(sdp))
         await this.flushPendingIceCandidates(this.peerConnection)
       }
@@ -1197,7 +1377,11 @@ export class MsnWebRTCService {
     if (type === 'ice-candidate') {
       const candidate = data.candidate as RTCIceCandidateInit
       if (!candidate) return
-      if (this.peerConnection && this.peerConnection.remoteDescription) {
+      if (
+        this.peerConnection &&
+        this.peerConnection.remoteDescription &&
+        this.peerConnection.remoteDescription.type
+      ) {
         await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {})
       } else {
         this.pendingIceCandidates.push(candidate)
@@ -1206,11 +1390,37 @@ export class MsnWebRTCService {
     }
 
     if (type === 'hangup') {
-      // O amigo saiu da Sala: limpamos apenas as streams remotas dele, mantendo nossa própria estadia na Sala se estivermos nela!
+      // O amigo saiu da Sala: limpamos streams remotas e resetamos IDs
       this.friendInRoom = false
-      this.remoteVoiceStream = null
-      this.remoteCamStream = null
-      this.remoteScreenStream = null
+      if (this.remoteVoiceStream) {
+        this.remoteVoiceStream.getTracks().forEach((t) => {
+          try {
+            t.stop()
+          } catch {}
+        })
+        this.remoteVoiceStream = null
+      }
+      if (this.remoteCamStream) {
+        this.remoteCamStream.getVideoTracks().forEach((t) => {
+          try {
+            t.stop()
+          } catch {}
+        })
+        this.remoteCamStream = null
+      }
+      if (this.remoteScreenStream) {
+        this.remoteScreenStream.getTracks().forEach((t) => {
+          try {
+            t.stop()
+          } catch {}
+        })
+        this.remoteScreenStream = null
+      }
+      this.remoteStreamIds = {
+        micStreamId: null,
+        camStreamId: null,
+        screenStreamId: null
+      }
       this.emitStreamsUpdated()
       this.emitCallState()
     }
@@ -2040,9 +2250,30 @@ export class MsnWebRTCService {
 
   private cleanupMediaStreams(): void {
     this.cleanupLocalMediaStreams()
-    this.remoteVoiceStream = null
-    this.remoteCamStream = null
-    this.remoteScreenStream = null
+    if (this.remoteVoiceStream) {
+      this.remoteVoiceStream.getTracks().forEach((t) => {
+        try {
+          t.stop()
+        } catch {}
+      })
+      this.remoteVoiceStream = null
+    }
+    if (this.remoteCamStream) {
+      this.remoteCamStream.getVideoTracks().forEach((t) => {
+        try {
+          t.stop()
+        } catch {}
+      })
+      this.remoteCamStream = null
+    }
+    if (this.remoteScreenStream) {
+      this.remoteScreenStream.getTracks().forEach((t) => {
+        try {
+          t.stop()
+        } catch {}
+      })
+      this.remoteScreenStream = null
+    }
   }
 
   private emitStreamsUpdated(): void {
@@ -2074,9 +2305,14 @@ export class MsnWebRTCService {
   public destroy(): void {
     if (this.vadInterval) clearInterval(this.vadInterval)
     if (this.silenceTimeout) clearTimeout(this.silenceTimeout)
+    if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout)
+    if (this.onlineHandler) {
+      window.removeEventListener('online', this.onlineHandler)
+      this.onlineHandler = null
+    }
     this.cleanupMediaStreams()
     this.dataChannel?.close()
-    this.peerConnection?.close()
+    this.resetPeerConnection()
     this.realtimeChannel?.unsubscribe()
   }
 }
