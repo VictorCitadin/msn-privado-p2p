@@ -265,13 +265,26 @@ const msnApi = {
     return () => ipcRenderer.removeListener('updater:status', handler)
   },
 
-  // Captura Nativa de Áudio Loopback (WASAPI com exclusão do processo do app)
-  startLoopbackCapture: (): Promise<boolean> => ipcRenderer.invoke('loopback:start'),
+  // Captura Nativa de Áudio Loopback (WASAPI com exclusão ou inclusão por processo)
+  startLoopbackCapture: (options?: {
+    mode?: 'include' | 'exclude'
+    targetPid?: number
+    hwnd?: number
+  }): Promise<boolean> => ipcRenderer.invoke('loopback:start', options),
   stopLoopbackCapture: (): Promise<boolean> => ipcRenderer.invoke('loopback:stop'),
   onLoopbackAudioChunk: (callback: (chunk: Uint8Array) => void): (() => void) => {
     const handler = (_event: Electron.IpcRendererEvent, chunk: Uint8Array): void => callback(chunk)
     ipcRenderer.on('loopback:audio-chunk', handler)
     return () => ipcRenderer.removeListener('loopback:audio-chunk', handler)
+  },
+  getWindowsBuild: (): Promise<number> => ipcRenderer.invoke('system:get-windows-build'),
+  onBeforeQuit: (callback: () => void): (() => void) => {
+    const handler = (): void => callback()
+    ipcRenderer.on('app:before-quit', handler)
+    return () => ipcRenderer.removeListener('app:before-quit', handler)
+  },
+  sendBeforeQuitDone: (): void => {
+    ipcRenderer.send('app:before-quit-done')
   }
 }
 

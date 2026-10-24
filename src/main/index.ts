@@ -12,6 +12,7 @@ import {
   session
 } from 'electron'
 import { join, extname } from 'path'
+import os from 'os'
 import { createServer, Server as HttpServer } from 'http'
 import { existsSync, copyFileSync } from 'fs'
 import { readFile } from 'fs/promises'
@@ -569,6 +570,11 @@ async function createMainWindow(): Promise<void> {
   mainWindow.webContents.setWindowOpenHandler((details) => {
     shell.openExternal(details.url)
     return { action: 'deny' }
+  })
+
+  mainWindow.webContents.on('render-process-gone', () => {
+    console.warn('[Main] Render process gone, finalizando captura loopback...')
+    stopLoopbackProcess()
   })
 
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
@@ -1321,63 +1327,123 @@ function registerIpcHandlers(): void {
     autoUpdater.quitAndInstall()
   })
 
-  // Captura Nativa de Áudio Loopback (WASAPI) excluindo o áudio do MSN Privado
-  ipcMain.handle('loopback:start', async (event) => {
-    stopLoopbackProcess()
+  function getWindowsBuild(): number {
+    if (process.platform !== 'win32') return 0
+    const rel = os.release()
+    const parts = rel.split('.')
+    return parts.length >= 3 ? parseInt(parts[2], 10) : 0
+  }
 
-    const exeName = 'loopback-capture.exe'
-    const possiblePaths = [
-      join(app.getAppPath(), 'resources', exeName),
-      join(process.resourcesPath, exeName),
-      join(process.resourcesPath, 'resources', exeName),
-      join(__dirname, '../../resources', exeName),
-      join(__dirname, '../resources', exeName)
-    ]
-    const exePath = possiblePaths.find((p) => existsSync(p))
-    if (!exePath) {
-      console.warn('[Loopback] Executável loopback-capture.exe não encontrado nos caminhos:', possiblePaths)
-      return false
+  ipcMain.handle('system:get-windows-build', () => getWindowsBuild())
+
+  // Captura Nativa de Áudio Loopback (WASAPI com exclusão ou inclusão por processo - Estilo Discord)
+  ipcMain.handle(
+    'loopback:start',
+    async (
+      event,
+      options?: { mode?: 'include' | 'exclude'; targetPid?: number; hwnd?: number }
+    ) => {
+      stopLoopbackProcess()
+
+      const winBuild = getWindowsBuild()
+      if (winBuild > 0 && winBuild < 20348) {
+        console.warn(
+          `[Loopback] Versão do Windows build ${winBuild} não suporta Process Loopback nativo (requer >= 20348).`
+        )
+        return false
+      }
+
+      const exeName = 'loopback-capture.exe'
+      const possiblePaths = [
+        join(app.getAppPath(), 'resources', exeName),
+        join(process.resourcesPath, exeName),
+        join(process.resourcesPath, 'resources', exeName),
+        join(__dirname, '../../resources', exeName),
+        join(__dirname, '../resources', exeName)
+      ]
+      const exePath = possiblePaths.find((p) => existsSync(p))
+      if (!exePath) {
+        console.warn(
+          '[Loopback] Executável loopback-capture.exe não encontrado nos caminhos:',
+          possiblePaths
+        )
+        return false
+      }
+
+      try {
+        const mode = options?.mode === 'include' ? 'include' : 'exclude'
+        const spawnArgs = ['--mode', mode, '--parent-pid', String(process.pid)]
+        if (options?.hwnd) {
+          spawnArgs.push('--hwnd', String(options.hwnd))
+        } else if (options?.targetPid) {
+          spawnArgs.push('--pid', String(options.targetPid))
+        } else {
+          spawnArgs.push('--pid', String(process.pid))
+        }
+
+        console.log(`[Loopback] Iniciando loopback-capture.exe [${spawnArgs.join(' ')}]: ${exePath}`)
+        const child = spawn(exePath, spawnArgs, {
+          windowsHide: true,
+          stdio: ['pipe', 'pipe', 'pipe']
+        })
+
+        loopbackProcess = child
+
+        child.stdout.on('data', (chunk: Buffer) => {
+          if (!event.sender.isDestroyed()) {
+            event.sender.send('loopback:audio-chunk', chunk)
+          }
+        })
+
+        child.on('exit', (code) => {
+          console.log('[Loopback] Processo encerrado com código:', code)
+          if (loopbackProcess === child) {
+            loopbackProcess = null
+          }
+        })
+
+        child.on('error', (err) => {
+          console.error('[Loopback] Erro no processo filho:', err)
+          if (loopbackProcess === child) {
+            loopbackProcess = null
+          }
+        })
+
+        return new Promise<boolean>((resolve) => {
+          let settled = false
+          const timeout = setTimeout(() => {
+            if (!settled) {
+              settled = true
+              console.warn('[Loopback] Timeout de 3.5s aguardando LOOPBACK_READY.')
+              resolve(false)
+            }
+          }, 3500)
+
+          child.stderr.on('data', (data: Buffer) => {
+            const msg = data.toString('utf8')
+            console.log('[Loopback STDERR]', msg)
+            if (msg.includes('LOOPBACK_READY')) {
+              if (!settled) {
+                settled = true
+                clearTimeout(timeout)
+                resolve(true)
+              }
+            } else if (msg.includes('LOOPBACK_ERROR')) {
+              if (!settled) {
+                settled = true
+                clearTimeout(timeout)
+                stopLoopbackProcess()
+                resolve(false)
+              }
+            }
+          })
+        })
+      } catch (err) {
+        console.error('[Loopback] Falha ao fazer spawn de loopback-capture.exe:', err)
+        return false
+      }
     }
-
-    try {
-      console.log(`[Loopback] Iniciando captura nativa excluindo PID ${process.pid}: ${exePath}`)
-      const child = spawn(exePath, [String(process.pid), 'exclude'], {
-        windowsHide: true,
-        stdio: ['pipe', 'pipe', 'pipe']
-      })
-
-      loopbackProcess = child
-
-      child.stdout.on('data', (chunk: Buffer) => {
-        if (!event.sender.isDestroyed()) {
-          event.sender.send('loopback:audio-chunk', chunk)
-        }
-      })
-
-      child.stderr.on('data', (data: Buffer) => {
-        console.warn('[Loopback STDERR]', data.toString('utf8'))
-      })
-
-      child.on('exit', (code) => {
-        console.log('[Loopback] Processo encerrado com código:', code)
-        if (loopbackProcess === child) {
-          loopbackProcess = null
-        }
-      })
-
-      child.on('error', (err) => {
-        console.error('[Loopback] Erro no processo filho:', err)
-        if (loopbackProcess === child) {
-          loopbackProcess = null
-        }
-      })
-
-      return true
-    } catch (err) {
-      console.error('[Loopback] Falha ao fazer spawn de loopback-capture.exe:', err)
-      return false
-    }
-  })
+  )
 
   ipcMain.handle('loopback:stop', async () => {
     stopLoopbackProcess()
@@ -1475,13 +1541,39 @@ if (!gotSingleInstanceLock) {
   })
 }
 
-app.on('before-quit', () => {
-  isQuitting = true
-  stopLoopbackProcess()
-  try {
-    tray?.destroy()
-    tray = null
-  } catch {}
+app.on('before-quit', (e) => {
+  if (isQuitting) {
+    stopLoopbackProcess()
+    try {
+      tray?.destroy()
+      tray = null
+    } catch {}
+    return
+  }
+
+  // Notifica o renderer para realizar untrack no Supabase e enviar hangup/room-state limpo
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    e.preventDefault()
+    isQuitting = true
+    mainWindow.webContents.send('app:before-quit')
+    const forceQuitTimer = setTimeout(() => {
+      stopLoopbackProcess()
+      app.quit()
+    }, 800)
+
+    ipcMain.once('app:before-quit-done', () => {
+      clearTimeout(forceQuitTimer)
+      stopLoopbackProcess()
+      app.quit()
+    })
+  } else {
+    isQuitting = true
+    stopLoopbackProcess()
+    try {
+      tray?.destroy()
+      tray = null
+    } catch {}
+  }
 })
 
 app.on('will-quit', () => {

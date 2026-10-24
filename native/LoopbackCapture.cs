@@ -1,20 +1,23 @@
 // ============================================================================
-// Vitinho e Will - Captura de Áudio do Sistema EXCLUINDO o próprio aplicativo
+// Vitinho e Will - Captura de Áudio do Sistema Estilo Discord (Window / Desktop Loopback)
 // ----------------------------------------------------------------------------
 // Usa a API nativa do Windows 10 2004+ / Windows 11 "Process Loopback"
-// (AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK) no modo
-// PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE.
+// (AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK).
 //
-// Resultado: captura TODO o som do PC (jogo, filme, YouTube, Spotify...)
-// MENOS o som que sai do processo do app (voz do amigo, DJ Bot, efeitos),
-// eliminando 100% o retorno da voz no compartilhamento de tela.
+// 1. Ao compartilhar janela: AUDIOCLIENT_PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
+//    Captura APENAS o som daquele processo e de seus subprocessos (filhos).
+// 2. Ao compartilhar tela inteira: AUDIOCLIENT_PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
+//    Captura TODO o som do PC EXCETO o processo do MSN (voz do amigo, DJ bot, efeitos).
 //
-// Uso:   loopback-capture.exe <pid-do-app> [exclude|include]
-// Saída: PCM s16le 48000 Hz estéreo contínuo no stdout.
-// Encerra sozinho quando o stdin é fechado (app principal fechou).
+// Resultado: 100% livre de retorno da própria voz / eco, com fidelidade de estúdio.
 //
-// Compilação (csc do .NET Framework, presente em todo Windows):
-//   npm run build:loopback
+// Argumentos aceitos:
+//   --mode include|exclude
+//   --pid <n>
+//   --hwnd <n>
+//   --parent-pid <n>
+// Ou legado:
+//   <pid> [exclude|include]
 // ============================================================================
 using System;
 using System.IO;
@@ -114,6 +117,9 @@ namespace VitinhoWillLoopback
             IActivateAudioInterfaceCompletionHandler completionHandler,
             out IActivateAudioInterfaceAsyncOperation activationOperation);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
         static volatile bool running = true;
 
         static void Fail(string message, int hr)
@@ -126,16 +132,63 @@ namespace VitinhoWillLoopback
         [MTAThread]
         static int Main(string[] args)
         {
-            if (args.Length < 1)
+            uint targetPid = 0;
+            int loopbackMode = 1; // 1 = EXCLUDE_TARGET_PROCESS_TREE (padrão), 0 = INCLUDE_TARGET_PROCESS_TREE
+            uint parentPid = 0;
+            long hwndVal = 0;
+
+            // Parser flexível de argumentos CLI
+            for (int i = 0; i < args.Length; i++)
             {
-                Console.Error.WriteLine("uso: loopback-capture.exe <pid> [exclude|include]");
+                string arg = args[i];
+                if (arg == "--mode" && i + 1 < args.Length)
+                {
+                    loopbackMode = args[++i].ToLowerInvariant() == "include" ? 0 : 1;
+                }
+                else if (arg == "--pid" && i + 1 < args.Length)
+                {
+                    uint.TryParse(args[++i], out targetPid);
+                }
+                else if (arg == "--hwnd" && i + 1 < args.Length)
+                {
+                    long.TryParse(args[++i], out hwndVal);
+                }
+                else if (arg == "--parent-pid" && i + 1 < args.Length)
+                {
+                    uint.TryParse(args[++i], out parentPid);
+                }
+                else if (!arg.StartsWith("--"))
+                {
+                    // Compatibilidade legada: <pid> [exclude|include]
+                    if (targetPid == 0)
+                    {
+                        uint.TryParse(arg, out targetPid);
+                    }
+                    else
+                    {
+                        loopbackMode = arg.ToLowerInvariant() == "include" ? 0 : 1;
+                    }
+                }
+            }
+
+            // Se recebeu HWND de uma janela alvo, resolve o PID correspondente
+            if (hwndVal != 0)
+            {
+                uint winPid = 0;
+                GetWindowThreadProcessId(new IntPtr(hwndVal), out winPid);
+                if (winPid != 0)
+                {
+                    targetPid = winPid;
+                }
+            }
+
+            if (targetPid == 0)
+            {
+                Console.Error.WriteLine("LOOPBACK_ERROR TargetPidInvalido hr=0x80004005");
                 return 1;
             }
 
-            uint targetPid = uint.Parse(args[0]);
-            int loopbackMode = (args.Length > 1 && args[1] == "include") ? 0 : 1; // 1 = EXCLUDE_TARGET_PROCESS_TREE
-
-            // Encerra automaticamente quando o app principal fechar (stdin fechado)
+            // 1. Encerra automaticamente quando o app pai fechar (stdin EOF)
             Thread stdinWatcher = new Thread(delegate ()
             {
                 try
@@ -150,6 +203,34 @@ namespace VitinhoWillLoopback
             });
             stdinWatcher.IsBackground = true;
             stdinWatcher.Start();
+
+            // 2. Watchdog de Parent Process (impede 100% processos órfãos mesmo em kill forçado)
+            if (parentPid != 0)
+            {
+                Thread parentWatcher = new Thread(delegate ()
+                {
+                    while (running)
+                    {
+                        Thread.Sleep(1000);
+                        try
+                        {
+                            System.Diagnostics.Process p = System.Diagnostics.Process.GetProcessById((int)parentPid);
+                            if (p.HasExited)
+                            {
+                                running = false;
+                                Environment.Exit(0);
+                            }
+                        }
+                        catch
+                        {
+                            running = false;
+                            Environment.Exit(0);
+                        }
+                    }
+                });
+                parentWatcher.IsBackground = true;
+                parentWatcher.Start();
+            }
 
             // AUDIOCLIENT_ACTIVATION_PARAMS { ActivationType; { TargetProcessId; ProcessLoopbackMode } }
             IntPtr activationParams = Marshal.AllocHGlobal(12);
@@ -171,7 +252,7 @@ namespace VitinhoWillLoopback
                 VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, IID_IAudioClient, propVariant, handler, out asyncOp);
             if (hrActivate < 0) Fail("ActivateAudioInterfaceAsync", hrActivate);
 
-            if (!handler.Done.WaitOne(5000)) Fail("ActivateTimeout", -1);
+            if (!handler.Done.WaitOne(4000)) Fail("ActivateTimeout", -1);
             if (handler.Hr < 0 || handler.Result == null) Fail("ActivateResult", handler.Hr);
 
             IAudioClient client = (IAudioClient)handler.Result;

@@ -355,6 +355,7 @@ const MainMsnMessengerWindow: React.FC = () => {
   // Toca som ao alguém entrar na Sala de ligação e som ao alguém sair da Sala
   const prevInCallRef = useRef<boolean>(false)
   const prevFriendInRoomRef = useRef<boolean>(false)
+  const droppedByNetworkRef = useRef<boolean>(false)
   useEffect(() => {
     const myJoined = !prevInCallRef.current && inCall
     const myLeft = prevInCallRef.current && !inCall
@@ -367,7 +368,12 @@ const MainMsnMessengerWindow: React.FC = () => {
     if (myJoined || friendJoined) {
       soundManager.play('room-join')
     } else if (myLeft || friendLeft) {
-      soundManager.play('room-leave')
+      // Bug 15: Evita som duplicado se a saída foi acionada pelo onCallDropped
+      if (droppedByNetworkRef.current) {
+        droppedByNetworkRef.current = false
+      } else {
+        soundManager.play('room-leave')
+      }
     }
   }, [inCall, friendInRoom])
 
@@ -685,6 +691,7 @@ const MainMsnMessengerWindow: React.FC = () => {
         soundManager.stopRingLoop()
       },
       onCallDropped: (reason) => {
+        droppedByNetworkRef.current = true
         soundManager.play('room-leave')
         setRoomViewActive(false)
         setInCall(false)
@@ -802,8 +809,17 @@ const MainMsnMessengerWindow: React.FC = () => {
     }
     window.addEventListener('beforeunload', handleBeforeUnload)
 
+    // Bug 16: Intercepta encerramento limpo do Electron para garantir untrack no Supabase e hangup
+    const unsubBeforeQuit = window.msnApi?.onBeforeQuit?.(() => {
+      try {
+        service.destroy()
+      } catch {}
+      window.msnApi?.sendBeforeQuitDone?.()
+    })
+
     return () => {
       window.removeEventListener('beforeunload', handleBeforeUnload)
+      unsubBeforeQuit?.()
       unsubMute()
       unsubAlbumBroadcast()
       unsubQueueAlbum()

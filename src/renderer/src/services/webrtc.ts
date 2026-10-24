@@ -285,15 +285,22 @@ export class MsnWebRTCService {
 
   // Presença com Timestamp e Instância Única (Elimina Presença Fantasma)
   private instanceId = `${Math.random().toString(36).slice(2, 10)}-${Date.now()}`
+  private protocolVersion = 2
   private presenceHeartbeatInterval: ReturnType<typeof setInterval> | null = null
   private presenceSweepInterval: ReturnType<typeof setInterval> | null = null
   private friendPresenceLastSeen = 0
+  private friendPresenceReceivedAt = 0
+  private friendLastSeenRemote = 0
+  private friendLastSubnick = ''
   private lastFriendP2PHeartbeat = 0
+  private lastFriendRealtimeHeartbeat = 0
   private lastFriendSignalReceived = 0
   private visibilityHandler: (() => void) | null = null
+  private isDestroyed = false
 
   // Monitoramento de Saúde da Ligação e Auto-Drop
   private callHealth: 'connecting' | 'healthy' | 'degraded' | 'recovering' | 'dead' = 'connecting'
+  private friendJoinedThisCall = false
   private callHealthInterval: ReturnType<typeof setInterval> | null = null
   private p2pHeartbeatInterval: ReturnType<typeof setInterval> | null = null
   private p2pHeartbeatSeq = 0
@@ -303,7 +310,9 @@ export class MsnWebRTCService {
   private lastAudioBytesStallCount = 0
 
   // Reconexão Automática P2P (ICE Restart) & Rede
-  private reconnectTimeout: ReturnType<typeof setTimeout> | null = null
+  private disconnectGraceTimer: ReturnType<typeof setTimeout> | null = null
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private reconnectResetTimer: ReturnType<typeof setTimeout> | null = null
   private isReconnecting = false
   private onlineHandler: (() => void) | null = null
 
@@ -378,6 +387,7 @@ export class MsnWebRTCService {
 
       this.realtimeChannel
         .on('presence', { event: 'sync' }, () => {
+          if (this.isDestroyed) return
           const state = this.realtimeChannel?.presenceState() || {}
           const rawList = (state[this.friendUser] as Array<{
             user?: string
@@ -387,6 +397,7 @@ export class MsnWebRTCService {
             instanceId?: string
             lastSeen?: number
             online_at?: string
+            protocolVersion?: number
           }>) || []
 
           if (rawList.length > 0) {
@@ -400,15 +411,31 @@ export class MsnWebRTCService {
             const lastSeen = latest.lastSeen || (latest.online_at ? new Date(latest.online_at).getTime() : 0)
             this.friendPresenceLastSeen = lastSeen
 
-            const isFresh = Date.now() - lastSeen < 25000
+            // Bug 6: Usa timestamp local de recebimento para evitar dessincronia por relógio do Windows diferente
+            if (lastSeen !== this.friendLastSeenRemote) {
+              this.friendLastSeenRemote = lastSeen
+              this.friendPresenceReceivedAt = Date.now()
+            }
+
+            const isFresh =
+              this.friendPresenceReceivedAt > 0 && Date.now() - this.friendPresenceReceivedAt < 25000
             if (isFresh) {
               const newStatus: PresenceStatus = latest.status || 'online'
               const rawSub = latest.subnick === 'Disponível no MSN Privado 🎮' ? '' : latest.subnick
               const newSubnick = rawSub || ''
+              this.friendLastSubnick = newSubnick
               const justLoggedIn = this.friendLastStatus === 'offline' && newStatus !== 'offline'
               this.friendLastStatus = newStatus
               if (typeof latest.inRoom === 'boolean') {
+                const wasInRoom = this.friendInRoom
                 this.friendInRoom = latest.inRoom
+                if (latest.inRoom) {
+                  this.friendJoinedThisCall = true
+                } else if (wasInRoom && this.inCall && this.friendJoinedThisCall) {
+                  this.friendJoinedThisCall = false
+                  this.handleCallDead('O amigo saiu da sala.')
+                  return
+                }
                 this.emitCallState()
               }
               this.callbacks.onFriendPresenceChange(newStatus, newSubnick, justLoggedIn)
@@ -431,50 +458,60 @@ export class MsnWebRTCService {
             } else {
               this.markFriendOffline()
             }
-          } else {
-            this.markFriendOffline()
           }
+          // Bug 7: Quando rawList está vazia temporariamente (reconexão do WebSocket),
+          // NÃO derruba nem apaga streams remotos imediatamente. A varredura cuidará disso se persistir.
         })
         .on('broadcast', { event: 'webrtc-signal' }, async ({ payload }) => {
           if (!payload || payload.target !== this.myUser) return
           this.lastFriendSignalReceived = Date.now()
+          this.lastFriendRealtimeHeartbeat = Date.now()
           await this.handleIncomingSignal(payload.sender, payload.type, payload.data)
         })
         .on('broadcast', { event: 'msn-packet' }, ({ payload }) => {
           if (!payload || payload.target !== this.myUser) return
           this.lastFriendSignalReceived = Date.now()
+          this.lastFriendRealtimeHeartbeat = Date.now()
           this.handleDataChannelPacket(payload.packet)
         })
         .subscribe(async (status) => {
+          if (this.isDestroyed) return
           if (status === 'SUBSCRIBED') {
             this.trackPresenceState()
           } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
             console.warn('[WebRTC] Canal Realtime reconectando status:', status)
-            setTimeout(() => {
-              if (this.realtimeChannel) {
-                this.realtimeChannel.subscribe()
-              }
-            }, 3000)
+            if (!this.isDestroyed) {
+              setTimeout(() => {
+                if (this.realtimeChannel && !this.isDestroyed) {
+                  this.realtimeChannel.subscribe()
+                }
+              }, 3000)
+            }
           }
         })
 
       // Envia heartbeat contínuo de presença a cada 8 segundos (impede que o amigo me veja offline)
       if (this.presenceHeartbeatInterval) clearInterval(this.presenceHeartbeatInterval)
       this.presenceHeartbeatInterval = setInterval(() => {
-        this.trackPresenceState()
+        if (!this.isDestroyed) this.trackPresenceState()
       }, 8000)
 
       // Varredura a cada 4 segundos combinando Presença Realtime + Heartbeat P2P + Sinais
       if (this.presenceSweepInterval) clearInterval(this.presenceSweepInterval)
       this.presenceSweepInterval = setInterval(() => {
-        this.sweepPresenceAndOnlineStatus()
+        if (!this.isDestroyed) this.sweepPresenceAndOnlineStatus()
       }, 4000)
     }
   }
 
   private sweepPresenceAndOnlineStatus(): void {
     const isOnline = this.computeIsFriendOnline()
-    if (!isOnline && this.friendLastStatus !== 'offline') {
+    if (isOnline && this.friendLastStatus === 'offline') {
+      // Bug 10: Se o amigo voltou a responder sinais ou P2P, emite online imediatamente
+      this.friendLastStatus = 'online'
+      this.callbacks.onFriendPresenceChange('online', this.friendLastSubnick || '', true)
+      this.emitCallState()
+    } else if (!isOnline && this.friendLastStatus !== 'offline') {
       console.log('[WebRTC] Timeout de presença/sinais do amigo: marcando como offline.')
       this.markFriendOffline()
     }
@@ -484,7 +521,8 @@ export class MsnWebRTCService {
     const now = Date.now()
     const p2pActive = now - this.lastFriendP2PHeartbeat < 10000
     const signalActive = now - this.lastFriendSignalReceived < 25000
-    const presenceActive = this.friendPresenceLastSeen > 0 && now - this.friendPresenceLastSeen < 25000
+    const presenceActive =
+      this.friendPresenceReceivedAt > 0 && now - this.friendPresenceReceivedAt < 25000
 
     return p2pActive || signalActive || presenceActive
   }
@@ -492,12 +530,18 @@ export class MsnWebRTCService {
   private markFriendOffline(): void {
     const wasOnline = this.friendLastStatus !== 'offline'
     this.friendLastStatus = 'offline'
-    this.friendInRoom = false
-    this.remoteVoiceStream = null
-    this.remoteCamStream = null
-    this.remoteScreenStream = null
-    this.emitStreamsUpdated()
-    this.emitCallState()
+
+    // Bug 7: NUNCA anula streams remotos se a chamada P2P estiver viva e com heartbeats recentes!
+    const isP2pLiveInCall = this.inCall && Date.now() - this.lastFriendP2PHeartbeat < 10000
+    if (!isP2pLiveInCall) {
+      this.friendInRoom = false
+      this.remoteVoiceStream = null
+      this.remoteCamStream = null
+      this.remoteScreenStream = null
+      this.emitStreamsUpdated()
+      this.emitCallState()
+    }
+
     if (wasOnline) {
       this.callbacks.onFriendPresenceChange('offline', 'Offline', false)
     }
@@ -512,7 +556,8 @@ export class MsnWebRTCService {
       | 'renegotiate-offer'
       | 'room-sync-request'
       | 'screen-share-state'
-      | 'p2p-heartbeat',
+      | 'p2p-heartbeat'
+      | 'reconnect-request',
     data: Record<string, unknown>
   ): Promise<void> {
     // Envio instantâneo e com latência mínima via WebSocket do Supabase Realtime Broadcast
@@ -574,18 +619,39 @@ export class MsnWebRTCService {
     pc.oniceconnectionstatechange = () => {
       console.log('[WebRTC] ICE Connection State:', pc.iceConnectionState)
       if (pc.iceConnectionState === 'connected') {
-        this.callHealth = 'healthy'
-        this.iceRestartAttempts = 0
-        this.fullReconnectAttempts = 0
+        if (this.disconnectGraceTimer) {
+          clearTimeout(this.disconnectGraceTimer)
+          this.disconnectGraceTimer = null
+        }
+        if (this.reconnectTimer) {
+          clearTimeout(this.reconnectTimer)
+          this.reconnectTimer = null
+        }
+
+        // Bug 2: Contadores de tentativa de reconexão só voltam a zero após 10s contínuos e estáveis
+        if (this.reconnectResetTimer) clearTimeout(this.reconnectResetTimer)
+        this.reconnectResetTimer = setTimeout(() => {
+          if (this.peerConnection?.iceConnectionState === 'connected') {
+            this.iceRestartAttempts = 0
+            this.fullReconnectAttempts = 0
+            this.reconnectResetTimer = null
+          }
+        }, 10000)
+
+        // Bug 4: Call health vira healthy se o P2P heartbeat foi recente (< 6s)
+        if (Date.now() - this.lastFriendP2PHeartbeat < 6000) {
+          this.callHealth = 'healthy'
+        }
         this.emitCallState()
       } else if (pc.iceConnectionState === 'disconnected') {
         this.callHealth = 'degraded'
         this.emitCallState()
-        // Se permanecer desconectado por mais de 2.5s, inicia ICE restart preventivo
-        if (!this.reconnectTimeout) {
-          this.reconnectTimeout = setTimeout(() => {
-            this.reconnectTimeout = null
-            if (this.peerConnection?.iceConnectionState === 'disconnected') {
+        // Bug 3: Timer de graça de 2.5s antes de forçar reconexão. Se virar failed antes, o failed assume imediatamente.
+        if (!this.disconnectGraceTimer) {
+          this.disconnectGraceTimer = setTimeout(() => {
+            this.disconnectGraceTimer = null
+            const currentState = this.peerConnection?.iceConnectionState
+            if (currentState === 'disconnected' || currentState === 'failed') {
               this.triggerAutoReconnect().catch(() => {})
             }
           }, 2500)
@@ -593,16 +659,20 @@ export class MsnWebRTCService {
       } else if (pc.iceConnectionState === 'failed') {
         this.callHealth = 'recovering'
         this.emitCallState()
-        this.handleConnectionFailure()
+        if (this.disconnectGraceTimer) {
+          clearTimeout(this.disconnectGraceTimer)
+          this.disconnectGraceTimer = null
+        }
+        this.handleConnectionFailure(true)
       }
     }
 
     pc.onconnectionstatechange = () => {
       console.log('[WebRTC] Peer Connection State:', pc.connectionState)
       if (pc.connectionState === 'connected') {
-        this.callHealth = 'healthy'
-        this.iceRestartAttempts = 0
-        this.fullReconnectAttempts = 0
+        if (Date.now() - this.lastFriendP2PHeartbeat < 6000) {
+          this.callHealth = 'healthy'
+        }
         this.emitCallState()
       } else if (pc.connectionState === 'disconnected') {
         this.callHealth = 'degraded'
@@ -610,7 +680,7 @@ export class MsnWebRTCService {
       } else if (pc.connectionState === 'failed') {
         this.callHealth = 'recovering'
         this.emitCallState()
-        this.handleConnectionFailure()
+        this.handleConnectionFailure(true)
       }
     }
 
@@ -1054,6 +1124,13 @@ export class MsnWebRTCService {
     this.callHealth = 'connecting'
     this.iceRestartAttempts = 0
     this.fullReconnectAttempts = 0
+    this.friendJoinedThisCall = false
+    this.lastFriendP2PHeartbeat = Date.now()
+    this.lastFriendRealtimeHeartbeat = Date.now()
+    this.lastFriendSignalReceived = Date.now()
+    this.lastAudioBytesStallCount = 0
+    this.lastAudioBytesReceived = 0
+    this.p2pHeartbeatSeq = 0
     this.startCallHealthTimers()
     this.incomingCallFrom = null
     this.pendingOffer = null
@@ -1264,11 +1341,36 @@ export class MsnWebRTCService {
 
     const rawScreenAudioTrack = rawDesktopStream.getAudioTracks()[0]
     if (includeSystemAudio) {
-      const excludedAudioTrack = await this.createExcludedLoopbackAudioTrack()
+      const isWindow = sourceId.startsWith('window:')
+      let windowHwnd: number | undefined
+      if (isWindow) {
+        const parts = sourceId.split(':')
+        if (parts.length > 1) {
+          const parsed = parseInt(parts[1], 10)
+          if (!isNaN(parsed) && parsed > 0) windowHwnd = parsed
+        }
+      }
+
+      const loopbackOptions =
+        isWindow && windowHwnd
+          ? { mode: 'include' as const, hwnd: windowHwnd }
+          : { mode: 'exclude' as const }
+
+      console.log('[WebRTC] Iniciando áudio do compartilhamento estilo Discord:', loopbackOptions)
+      const excludedAudioTrack = await this.createExcludedLoopbackAudioTrack(loopbackOptions)
       if (excludedAudioTrack) {
         finalScreenStream.addTrack(excludedAudioTrack)
       } else if (rawScreenAudioTrack) {
-        finalScreenStream.addTrack(rawScreenAudioTrack)
+        // Fallback seguro (S2): Se a captura nativa de exclusão não funcionou,
+        // passa pelo cancelador AudioWorklet que subtrai a voz do amigo.
+        // NUNCA envia a trilha bruta sem cancelamento para o amigo não se ouvir!
+        console.warn('[WebRTC] Captura nativa falhou; usando cancelador adaptativo AudioWorklet.')
+        const cancelledTrack = await this.createWorkletCancelledAudioTrack(rawScreenAudioTrack)
+        if (cancelledTrack) {
+          finalScreenStream.addTrack(cancelledTrack)
+        } else {
+          console.warn('[WebRTC] Sem cancelador disponível; desativando áudio do compartilhamento para proteger contra eco.')
+        }
       }
     }
 
@@ -1462,50 +1564,77 @@ export class MsnWebRTCService {
       const now = Date.now()
 
       // Se passou mais de 15 segundos sem NENHUM sinal, heartbeat ou presença do amigo, o amigo caiu
-      const noP2pHeartbeat = this.lastFriendP2PHeartbeat > 0 && now - this.lastFriendP2PHeartbeat > 15000
-      const noSignal = this.lastFriendSignalReceived > 0 && now - this.lastFriendSignalReceived > 15000
-      const noPresence = this.friendPresenceLastSeen > 0 && now - this.friendPresenceLastSeen > 20000
+      const noP2pHeartbeat =
+        this.lastFriendP2PHeartbeat > 0 && now - this.lastFriendP2PHeartbeat > 15000
+      const noSignal =
+        this.lastFriendSignalReceived > 0 && now - this.lastFriendSignalReceived > 15000
+      const noPresence =
+        this.friendPresenceReceivedAt > 0 && now - this.friendPresenceReceivedAt > 20000
 
-      if (noP2pHeartbeat && noSignal && noPresence) {
-        console.warn('[WebRTC] Timeout crítico de conexão (15s sem sinal do amigo). Desconectando automaticamente...')
+      if (noP2pHeartbeat && noSignal && noPresence && this.friendJoinedThisCall) {
+        console.warn(
+          '[WebRTC] Timeout crítico de conexão (15s sem sinal do amigo). Desconectando automaticamente...'
+        )
         this.handleCallDead('O amigo perdeu a conexão com a sala há mais de 15 segundos.')
         return
       }
 
-      // Verificação de Mídia Real via getStats()
-      if (this.peerConnection && this.peerConnection.connectionState === 'connected') {
+      // Bug 11: Verificação de Mídia Real via getStats() EXCLUSIVAMENTE no receptor da voz
+      if (
+        this.peerConnection &&
+        this.peerConnection.connectionState === 'connected' &&
+        !this.isReconnecting
+      ) {
         try {
-          const stats = await this.peerConnection.getStats()
-          let foundAudioInbound = false
-          let currentAudioBytes = 0
+          const audioTransceivers = this.peerConnection
+            .getTransceivers()
+            .filter((t) => t.receiver.track?.kind === 'audio')
 
-          stats.forEach((report) => {
-            if (report.type === 'inbound-rtp' && report.kind === 'audio') {
-              foundAudioInbound = true
-              currentAudioBytes = (report.bytesReceived as number) || 0
-            }
-          })
+          if (
+            audioTransceivers.length > 0 &&
+            audioTransceivers[0].receiver &&
+            this.friendInRoom &&
+            this.friendJoinedThisCall
+          ) {
+            const stats = await audioTransceivers[0].receiver.getStats()
+            let currentAudioBytes = 0
+            let foundVoiceInbound = false
 
-          if (foundAudioInbound && this.friendInRoom) {
-            if (currentAudioBytes === this.lastAudioBytesReceived && currentAudioBytes > 0) {
-              this.lastAudioBytesStallCount++
-              if (this.lastAudioBytesStallCount >= 2) { // 6 segundos estagnado
-                console.warn('[WebRTC] Mídia de áudio estagnada há mais de 6s com ICE conectado. Acionando reconexão preventiva...')
-                this.callHealth = 'degraded'
-                this.emitCallState()
-                this.handleConnectionFailure()
+            stats.forEach((report) => {
+              if (report.type === 'inbound-rtp' && report.kind === 'audio') {
+                foundVoiceInbound = true
+                currentAudioBytes = (report.bytesReceived as number) || 0
               }
-            } else {
-              this.lastAudioBytesReceived = currentAudioBytes
-              this.lastAudioBytesStallCount = 0
-              if (this.callHealth !== 'healthy') {
-                this.callHealth = 'healthy'
-                this.emitCallState()
+            })
+
+            if (foundVoiceInbound && currentAudioBytes > 0) {
+              if (currentAudioBytes === this.lastAudioBytesReceived) {
+                this.lastAudioBytesStallCount++
+                if (this.lastAudioBytesStallCount >= 2) {
+                  // 6 segundos estagnado com ICE conectado
+                  console.warn(
+                    '[WebRTC] Trilha de voz remota estagnada há mais de 6s. Acionando reconexão preventiva...'
+                  )
+                  this.lastAudioBytesStallCount = 0
+                  this.callHealth = 'degraded'
+                  this.emitCallState()
+                  this.handleConnectionFailure()
+                }
+              } else {
+                this.lastAudioBytesReceived = currentAudioBytes
+                this.lastAudioBytesStallCount = 0
+                if (
+                  this.callHealth !== 'healthy' &&
+                  Date.now() - this.lastFriendP2PHeartbeat < 6000
+                ) {
+                  this.callHealth = 'healthy'
+                  this.emitCallState()
+                }
               }
             }
           }
         } catch (err) {
-          console.warn('[WebRTC] Erro ao consultar getStats():', err)
+          console.warn('[WebRTC] Erro ao consultar getStats() da voz:', err)
         }
       }
     }, 3000)
@@ -1528,6 +1657,7 @@ export class MsnWebRTCService {
     this.inCall = false
     this.callHealth = 'dead'
     this.friendInRoom = false
+    this.friendJoinedThisCall = false
     this.stopCallHealthTimers()
     this.cleanupMediaStreams()
     this.resetPeerConnection()
@@ -1546,14 +1676,25 @@ export class MsnWebRTCService {
     this.callbacks.onCallDropped?.(reason)
   }
 
-  private handleConnectionFailure(): void {
-    if (this.reconnectTimeout) return
-    this.reconnectTimeout = setTimeout(() => {
-      this.reconnectTimeout = null
+  private handleConnectionFailure(immediate = false): void {
+    if (this.reconnectTimer) {
+      if (!immediate) return
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+
+    if (immediate) {
       this.triggerAutoReconnect().catch((err) => {
-        console.warn('[WebRTC] Falha na reconexão automática:', err)
+        console.warn('[WebRTC] Falha na reconexão automática imediata:', err)
       })
-    }, 1000)
+    } else {
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null
+        this.triggerAutoReconnect().catch((err) => {
+          console.warn('[WebRTC] Falha na reconexão automática:', err)
+        })
+      }, 1000)
+    }
   }
 
   private async triggerAutoReconnect(): Promise<void> {
@@ -1565,6 +1706,17 @@ export class MsnWebRTCService {
     console.log('[WebRTC] Executando reconexão automática P2P...')
 
     try {
+      // Bug 12: Vitinho (impolite) envia ofertas de ICE restart. Will solicita a oferta.
+      if (this.myUser === 'Will' && this.iceRestartAttempts === 0) {
+        console.log('[WebRTC] Will solicitando ICE Restart de Vitinho via sinal...')
+        await this.sendSignal('reconnect-request', { inRoom: true })
+        // Aguarda 4 segundos pela resposta de Vitinho; se não houver resposta, escalona para rebuild
+        await new Promise((resolve) => setTimeout(resolve, 4000))
+        if (this.peerConnection?.iceConnectionState === 'connected') {
+          return
+        }
+      }
+
       if (
         this.iceRestartAttempts < 3 &&
         this.peerConnection &&
@@ -1573,7 +1725,9 @@ export class MsnWebRTCService {
       ) {
         this.iceRestartAttempts++
         const backoffMs = Math.min(1000 * Math.pow(2, this.iceRestartAttempts - 1), 4000)
-        console.log(`[WebRTC] Tentativa ${this.iceRestartAttempts}/3 de ICE Restart com backoff ${backoffMs}ms...`)
+        console.log(
+          `[WebRTC] Tentativa ${this.iceRestartAttempts}/3 de ICE Restart com backoff ${backoffMs}ms...`
+        )
         if (backoffMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, backoffMs))
         }
@@ -1592,25 +1746,68 @@ export class MsnWebRTCService {
         })
         console.log('[WebRTC] ICE Restart offer enviado com sucesso!')
       } else if (this.fullReconnectAttempts < 2 && this.inCall) {
+        // Bug 2: rebuildCall interno que NÃO zera contadores!
         this.fullReconnectAttempts++
-        console.log(`[WebRTC] ICE Restart esgotado. Tentativa ${this.fullReconnectAttempts}/2 de reconstrução completa do PeerConnection...`)
-        this.resetPeerConnection()
-        await this.startCall(Boolean(this.localCamStream))
+        console.log(
+          `[WebRTC] ICE Restart esgotado. Tentativa ${this.fullReconnectAttempts}/2 de reconstrução completa...`
+        )
+        await this.rebuildCall()
       } else if (this.inCall) {
-        console.warn('[WebRTC] Todas as tentativas de reconexão esgotadas. Finalizando chamada como dead.')
+        console.warn(
+          '[WebRTC] Todas as tentativas de reconexão esgotadas. Finalizando chamada como dead.'
+        )
         this.handleCallDead('Não foi possível restabelecer a conexão P2P após várias tentativas.')
       }
     } catch (err) {
       console.warn('[WebRTC] Falha na reconexão automática:', err)
       if (this.fullReconnectAttempts < 2 && this.inCall) {
         this.fullReconnectAttempts++
-        this.resetPeerConnection()
-        await this.startCall(Boolean(this.localCamStream)).catch(() => {})
+        await this.rebuildCall().catch(() => {})
       } else if (this.inCall) {
         this.handleCallDead('Falha crítica ao restabelecer a conexão P2P.')
       }
     } finally {
       this.isReconnecting = false
+    }
+  }
+
+  // Bug 2: Reconstrução interna do PeerConnection preservando contadores de escalonamento
+  private async rebuildCall(): Promise<void> {
+    if (!this.inCall) return
+    this.resetPeerConnection()
+    const pc = this.ensurePeerConnection()
+
+    if (!this.dataChannel || this.dataChannel.readyState === 'closed') {
+      const dc = pc.createDataChannel('msn-p2p-data', { ordered: true })
+      this.setupDataChannel(dc)
+    }
+
+    this.attachLocalStreamsToPeer(pc)
+    await this.ensureTransceiversSendRecv(pc)
+    this.emitStreamsUpdated()
+    this.emitCallState()
+
+    if (this.myUser === 'Vitinho') {
+      this.makingOffer = true
+      try {
+        const offer = await pc.createOffer({
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: true
+        })
+        if (pc.signalingState === 'closed') return
+        await this.setLocalDescriptionSafe(pc, offer)
+        this.broadcastStreamMeta()
+        await this.sendSignal('sdp-offer', {
+          sdp: pc.localDescription,
+          isMediaCall: true,
+          inRoom: true,
+          streamIds: this.getLocalStreamIds()
+        })
+      } finally {
+        this.makingOffer = false
+      }
+    } else {
+      await this.sendSignal('room-sync-request', { inRoom: true })
     }
   }
 
@@ -1777,9 +1974,22 @@ export class MsnWebRTCService {
       return
     }
 
+    if (type === 'reconnect-request') {
+      console.log('[WebRTC] Solicitação de reconexão recebida de Will.')
+      if (this.myUser === 'Vitinho') {
+        this.triggerAutoReconnect().catch(() => {})
+      }
+      return
+    }
+
     if (type === 'p2p-heartbeat') {
       this.lastFriendSignalReceived = Date.now()
-      if (this.inCall && (this.callHealth === 'degraded' || this.callHealth === 'recovering')) {
+      this.lastFriendRealtimeHeartbeat = Date.now()
+      if (
+        this.inCall &&
+        this.peerConnection?.iceConnectionState === 'connected' &&
+        (this.callHealth === 'degraded' || this.callHealth === 'recovering')
+      ) {
         this.callHealth = 'healthy'
         this.emitCallState()
       }
@@ -1788,7 +1998,8 @@ export class MsnWebRTCService {
 
     if (type === 'hangup') {
       console.log('[WebRTC] Sinal de hangup recebido do amigo.')
-      if (this.inCall) {
+      if (this.inCall && this.friendJoinedThisCall) {
+        this.friendJoinedThisCall = false
         this.handleCallDead('O amigo encerrou a ligação ou saiu da sala.')
       } else {
         this.friendInRoom = false
@@ -1800,7 +2011,10 @@ export class MsnWebRTCService {
           camStreamId: null,
           screenStreamId: null
         }
-        this.resetPeerConnection()
+        // Bug 14: NÃO destrói o PeerConnection/DataChannel se não estávamos na chamada
+        if (this.myUser === 'Vitinho' && (!this.dataChannel || this.dataChannel.readyState !== 'open')) {
+          this.connectDataChannelOnly().catch(() => {})
+        }
         this.emitStreamsUpdated()
         this.emitCallState()
       }
@@ -2014,11 +2228,49 @@ export class MsnWebRTCService {
     }
   }
 
-  private async createExcludedLoopbackAudioTrack(): Promise<MediaStreamTrack | null> {
+  private async createWorkletCancelledAudioTrack(
+    rawTrack: MediaStreamTrack
+  ): Promise<MediaStreamTrack | null> {
     try {
-      const started = await window.msnApi.startLoopbackCapture()
+      const ctx = this.ensureAudioContext()
+      await this.ensureLoopbackCancellerWorklet(ctx)
+
+      const desktopSource = ctx.createMediaStreamSource(new MediaStream([rawTrack]))
+      const cancellerNode = new AudioWorkletNode(ctx, 'voice-loopback-canceller', {
+        numberOfInputs: 2,
+        numberOfOutputs: 1,
+        outputChannelCount: [2]
+      })
+
+      desktopSource.connect(cancellerNode, 0, 0)
+
+      if (this.remoteVoiceStream && this.remoteVoiceStream.getAudioTracks().length > 0) {
+        try {
+          const voiceSource = ctx.createMediaStreamSource(this.remoteVoiceStream)
+          voiceSource.connect(cancellerNode, 0, 1)
+        } catch (e) {
+          console.warn('[WebRTC] Falha ao conectar voz de referência no cancelador:', e)
+        }
+      }
+
+      const dest = ctx.createMediaStreamDestination()
+      cancellerNode.connect(dest)
+      console.log('[WebRTC] Trilha de áudio com cancelador adaptativo AudioWorklet ativada!')
+      return dest.stream.getAudioTracks()[0] || null
+    } catch (err) {
+      console.warn('[WebRTC] Falha ao criar trilha cancelada por worklet:', err)
+      return null
+    }
+  }
+
+  private async createExcludedLoopbackAudioTrack(options?: {
+    mode?: 'include' | 'exclude'
+    hwnd?: number
+  }): Promise<MediaStreamTrack | null> {
+    try {
+      const started = await window.msnApi.startLoopbackCapture(options)
       if (!started) {
-        console.warn('[WebRTC] Captura loopback nativa não iniciou; usando áudio padrão do desktop.')
+        console.warn('[WebRTC] Captura loopback nativa não iniciou (handshake/versão OS).')
         return null
       }
 
@@ -2061,9 +2313,9 @@ export class MsnWebRTCService {
           }
         }
 
-        // Mantém a latência do áudio baixa e ultra estável (~50ms)
+        // Mantém a latência do áudio baixa e ultra estável (~60ms de buffer alvo)
         if (bufferedFrames > 4800) {
-          const skip = bufferedFrames - 2400
+          const skip = bufferedFrames - 2880
           readIdx = (readIdx + skip) % RING_FRAMES
           bufferedFrames -= skip
         }
@@ -2071,6 +2323,9 @@ export class MsnWebRTCService {
 
       // ScriptProcessor com buffer de 1024 frames (~21ms a 48kHz)
       const processor = ctx.createScriptProcessor(1024, 0, 2)
+      let lastL = 0
+      let lastR = 0
+
       processor.onaudioprocess = (e) => {
         const outL = e.outputBuffer.getChannelData(0)
         const outR = e.outputBuffer.getChannelData(1)
@@ -2080,32 +2335,37 @@ export class MsnWebRTCService {
           if (bufferedFrames > 0) {
             outL[i] = ringL[readIdx]
             outR[i] = ringR[readIdx]
+            lastL = outL[i]
+            lastR = outR[i]
             readIdx = (readIdx + 1) % RING_FRAMES
             bufferedFrames--
           } else {
-            outL[i] = 0
-            outR[i] = 0
+            // Suavização anti-estalo / anti-clipping com fade suave
+            lastL *= 0.85
+            lastR *= 0.85
+            outL[i] = Math.abs(lastL) < 1e-4 ? 0 : lastL
+            outR[i] = Math.abs(lastR) < 1e-4 ? 0 : lastR
           }
         }
       }
 
-      // 1. Boost de Volume de 2.5x para som do sistema alto, claro e equilibrado
+      // S4: Volume natural com ganho 1.0 (não distorce nem estoura filmes/músicas)
       const boostGain = ctx.createGain()
-      boostGain.gain.value = 2.5
+      boostGain.gain.value = 1.0
 
-      // 2. Dynamics Compressor de hardware/estúdio: limita picos e previne clipping/distorção em volumes altos
+      // Limitador transparente de estúdio contra picos (-3dB threshold, ratio 4)
       const compressor = ctx.createDynamicsCompressor()
-      compressor.threshold.value = -6
-      compressor.knee.value = 6
-      compressor.ratio.value = 8
+      compressor.threshold.value = -3
+      compressor.knee.value = 4
+      compressor.ratio.value = 4
       compressor.attack.value = 0.003
-      compressor.release.value = 0.1
+      compressor.release.value = 0.05
 
       processor.connect(boostGain)
       boostGain.connect(compressor)
       compressor.connect(dest)
 
-      // 3. Keep-alive com ganho zero para ctx.destination (impede que o Chromium pause ou faça GC do ScriptProcessor com 0 entradas)
+      // Keep-alive com ganho zero para ctx.destination (impede que o Chromium pause ou faça GC do ScriptProcessor com 0 entradas)
       const dummyNode = ctx.createGain()
       dummyNode.gain.value = 0
       processor.connect(dummyNode)
@@ -2117,7 +2377,7 @@ export class MsnWebRTCService {
       this.loopbackAudioCompressorNode = compressor
       this.loopbackAudioDummyNode = dummyNode
 
-      console.log('[WebRTC] Áudio de tela nativo (Zero Retorno de Voz + Boost 2.5x) inicializado!')
+      console.log(`[WebRTC] Áudio de tela nativo (Modo ${options?.mode || 'exclude'}) inicializado com sucesso!`)
       return dest.stream.getAudioTracks()[0] || null
     } catch (err) {
       console.warn('[WebRTC] Falha ao iniciar loopback nativo:', err)
@@ -2367,8 +2627,13 @@ export class MsnWebRTCService {
       }
     }
 
-    // Fallback garantido via Supabase Realtime Broadcast para todos os pacotes de controle/chat/sala
-    if (!sent && packet.type !== 'file-chunk') {
+    // Fallback garantido via Supabase Realtime Broadcast (exceto arquivos e heartbeats P2P para não mascarar queda)
+    if (
+      !sent &&
+      packet.type !== 'file-chunk' &&
+      packet.type !== 'heartbeat' &&
+      packet.type !== 'heartbeat-ack'
+    ) {
       if (this.realtimeChannel) {
         this.realtimeChannel
           .send({
@@ -2445,6 +2710,7 @@ export class MsnWebRTCService {
       case 'heartbeat':
         this.lastFriendP2PHeartbeat = Date.now()
         this.lastFriendSignalReceived = Date.now()
+        this.friendJoinedThisCall = true
         this.sendDataChannelPacket({
           type: 'heartbeat-ack',
           sender: this.myUser,
@@ -2456,7 +2722,11 @@ export class MsnWebRTCService {
       case 'heartbeat-ack':
         this.lastFriendP2PHeartbeat = Date.now()
         this.lastFriendSignalReceived = Date.now()
-        if (this.callHealth !== 'healthy' && this.inCall) {
+        this.friendJoinedThisCall = true
+        if (
+          this.peerConnection?.iceConnectionState === 'connected' &&
+          this.inCall
+        ) {
           this.callHealth = 'healthy'
           this.emitCallState()
         }
@@ -2491,14 +2761,22 @@ export class MsnWebRTCService {
         break
 
       case 'room-state':
+        const previousFriendInRoom = this.friendInRoom
         this.friendInRoom = packet.inRoom
-        if (!packet.inRoom) {
+        if (packet.inRoom) {
+          this.friendJoinedThisCall = true
+        } else {
           this.remoteVoiceStream = null
           this.remoteCamStream = null
           this.remoteScreenStream = null
           this.emitStreamsUpdated()
-          if (this.inCall) {
-            console.log('[WebRTC] Amigo saiu da sala via room-state. Encerrando chamada local...')
+          // Bug 1: SÓ encerra chamada se o amigo estava na sala durante esta chamada e agora saiu!
+          // Se o usuário entrou sozinho e o amigo estava no chat (inRoom: false), NÃO derruba!
+          if (this.inCall && (previousFriendInRoom || this.friendJoinedThisCall)) {
+            console.log(
+              '[WebRTC] Amigo que estava na sala saiu via room-state. Encerrando chamada local...'
+            )
+            this.friendJoinedThisCall = false
             this.handleCallDead('O amigo saiu da sala.')
             return
           }
@@ -2721,7 +2999,7 @@ export class MsnWebRTCService {
   }
 
   private trackPresenceState(): void {
-    if (this.realtimeChannel) {
+    if (this.realtimeChannel && !this.isDestroyed) {
       this.realtimeChannel
         .track({
           user: this.myUser,
@@ -2730,6 +3008,7 @@ export class MsnWebRTCService {
           inRoom: this.inCall,
           instanceId: this.instanceId,
           lastSeen: Date.now(),
+          protocolVersion: this.protocolVersion,
           online_at: new Date().toISOString()
         })
         .catch(() => {})
@@ -2818,6 +3097,7 @@ export class MsnWebRTCService {
       this.friendInRoom &&
         isFriendReachable &&
         (this.callHealth === 'healthy' ||
+          this.callHealth === 'degraded' ||
           this.callHealth === 'recovering' ||
           this.callHealth === 'connecting' ||
           !this.inCall)
@@ -2837,9 +3117,12 @@ export class MsnWebRTCService {
   }
 
   public destroy(): void {
+    this.isDestroyed = true
     if (this.vadInterval) clearInterval(this.vadInterval)
     if (this.silenceTimeout) clearTimeout(this.silenceTimeout)
-    if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout)
+    if (this.disconnectGraceTimer) clearTimeout(this.disconnectGraceTimer)
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    if (this.reconnectResetTimer) clearTimeout(this.reconnectResetTimer)
     if (this.presenceHeartbeatInterval) {
       clearInterval(this.presenceHeartbeatInterval)
       this.presenceHeartbeatInterval = null

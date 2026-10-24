@@ -110,9 +110,16 @@ export interface MsnBridgeApi {
       message: string
     }) => void
   ) => () => void
-  startLoopbackCapture: () => Promise<boolean>
+  startLoopbackCapture: (options?: {
+    mode?: 'include' | 'exclude'
+    targetPid?: number
+    hwnd?: number
+  }) => Promise<boolean>
   stopLoopbackCapture: () => Promise<boolean>
   onLoopbackAudioChunk: (callback: (chunk: Uint8Array) => void) => () => void
+  getWindowsBuild: () => Promise<number>
+  onBeforeQuit: (callback: () => void) => () => void
+  sendBeforeQuitDone: () => void
 }
 
 declare global {
