@@ -335,11 +335,23 @@ export class MsnWebRTCService {
             }
             this.callbacks.onFriendPresenceChange(newStatus, newSubnick, justLoggedIn)
 
-            if (this.inCall && (justLoggedIn || !this.peerConnection)) {
+            if (this.inCall && latest.inRoom && !this.remoteCamStream) {
+              // Ambos estão na Sala, mas o stream ainda não conectou: dispara sincronização imediata
+              setTimeout(() => {
+                if (this.inCall && !this.remoteCamStream) {
+                  console.log('[WebRTC] Ambos na Sala sem vídeo remoto: sincronizando chamada...')
+                  if (this.myUser === 'Vitinho') {
+                    this.startCall(Boolean(this.localCamStream)).catch(() => {})
+                  } else {
+                    this.sendSignal('room-sync-request', {}).catch(() => {})
+                  }
+                }
+              }, 400)
+            } else if (this.inCall && (justLoggedIn || !this.peerConnection)) {
               // Se estamos na Sala e o amigo acabou de abrir o app, envia nossa webcam ao vivo para o Chat dele!
               setTimeout(() => {
                 if (this.inCall) {
-                  this.renegotiatePeerConnection().catch(() => {})
+                  this.publishRoomBroadcast().catch(() => {})
                 }
               }, 350)
             } else if (!this.inCall && latest.inRoom && !this.remoteCamStream) {
@@ -363,6 +375,10 @@ export class MsnWebRTCService {
         .on('broadcast', { event: 'webrtc-signal' }, async ({ payload }) => {
           if (!payload || payload.target !== this.myUser) return
           await this.handleIncomingSignal(payload.sender, payload.type, payload.data)
+        })
+        .on('broadcast', { event: 'msn-packet' }, ({ payload }) => {
+          if (!payload || payload.target !== this.myUser) return
+          this.handleDataChannelPacket(payload.packet)
         })
         .subscribe(async (status) => {
           if (status === 'SUBSCRIBED') {
@@ -446,150 +462,9 @@ export class MsnWebRTCService {
     }
 
     pc.ontrack = (event) => {
-      const track = event.track
-      const stream = event.streams[0] || new MediaStream([track])
-
-      const routeTrack = (): void => {
-        if (track.kind === 'audio') {
-          const isExplicitScreenAudio = Boolean(
-            this.remoteStreamIds.screenStreamId &&
-              stream.id === this.remoteStreamIds.screenStreamId
-          )
-          const isExplicitMic = Boolean(
-            this.remoteStreamIds.micStreamId &&
-              stream.id === this.remoteStreamIds.micStreamId
-          )
-          const audioLabel = track.label.toLowerCase()
-          const isScreenAudioLabel =
-            audioLabel.includes('screen') ||
-            audioLabel.includes('system') ||
-            audioLabel.includes('loopback') ||
-            audioLabel.includes('desktop')
-
-          const isScreenAudio = !isExplicitMic && (isExplicitScreenAudio || isScreenAudioLabel)
-
-          if (isScreenAudio) {
-            if (!this.remoteScreenStream) {
-              this.remoteScreenStream = new MediaStream()
-            }
-            if (!this.remoteScreenStream.getAudioTracks().some((t) => t.id === track.id)) {
-              this.remoteScreenStream.addTrack(track)
-            }
-          } else {
-            if (this.remoteVoiceStream) {
-              this.remoteVoiceStream.getAudioTracks().forEach((oldTrack) => {
-                if (oldTrack.id !== track.id) {
-                  try {
-                    oldTrack.stop()
-                  } catch {}
-                }
-              })
-            }
-            this.remoteVoiceStream = new MediaStream([track])
-            this.setupRemoteVoiceAnalyser(this.remoteVoiceStream)
-          }
-        } else if (track.kind === 'video') {
-          const isExplicitScreenId = Boolean(
-            this.remoteStreamIds.screenStreamId &&
-              stream.id === this.remoteStreamIds.screenStreamId
-          )
-          const isExplicitCamId = Boolean(
-            this.remoteStreamIds.camStreamId &&
-              stream.id === this.remoteStreamIds.camStreamId
-          )
-          const labelLower = track.label.toLowerCase()
-          const isExplicitScreenLabel =
-            labelLower.includes('screen') ||
-            labelLower.includes('window') ||
-            labelLower.includes('display') ||
-            labelLower.includes('desktop')
-
-          // Vídeo só é tratado como tela se for explicitamente tela, NUNCA por suposição
-          const isScreenVideo = !isExplicitCamId && (isExplicitScreenId || isExplicitScreenLabel)
-
-          if (isScreenVideo) {
-            if (!this.remoteScreenStream) {
-              this.remoteScreenStream = new MediaStream()
-            }
-            this.remoteScreenStream
-              .getVideoTracks()
-              .filter((t) => t.id !== track.id)
-              .forEach((t) => {
-                try {
-                  t.stop()
-                } catch {}
-                this.remoteScreenStream?.removeTrack(t)
-              })
-            if (!this.remoteScreenStream.getVideoTracks().some((t) => t.id === track.id)) {
-              this.remoteScreenStream.addTrack(track)
-            }
-          } else {
-            // Webcam normal do amigo: substitui qualquer track de câmera velha para nunca duplicar
-            if (this.remoteCamStream) {
-              this.remoteCamStream.getVideoTracks().forEach((oldTrack) => {
-                if (oldTrack.id !== track.id) {
-                  try {
-                    oldTrack.stop()
-                  } catch {}
-                }
-              })
-            }
-            this.remoteCamStream = new MediaStream([track])
-          }
-        }
-
-        this.emitStreamsUpdated()
-        this.emitCallState()
-      }
-
-      routeTrack()
-      track.onunmute = () => {
-        routeTrack()
-      }
-
-      track.onended = () => {
-        if (track.kind === 'video') {
-          if (
-            this.remoteScreenStream &&
-            this.remoteScreenStream.getVideoTracks().some((t) => t.id === track.id)
-          ) {
-            this.remoteScreenStream.removeTrack(track)
-            if (this.remoteScreenStream.getVideoTracks().length === 0) {
-              this.remoteScreenStream = null
-            }
-            this.emitStreamsUpdated()
-            this.emitCallState()
-          }
-          if (
-            this.remoteCamStream &&
-            this.remoteCamStream.getVideoTracks().some((t) => t.id === track.id)
-          ) {
-            this.remoteCamStream.removeTrack(track)
-            if (this.remoteCamStream.getVideoTracks().length === 0) {
-              this.remoteCamStream = null
-            }
-            this.emitStreamsUpdated()
-            this.emitCallState()
-          }
-        } else if (track.kind === 'audio') {
-          if (
-            this.remoteScreenStream &&
-            this.remoteScreenStream.getAudioTracks().some((t) => t.id === track.id)
-          ) {
-            this.remoteScreenStream.removeTrack(track)
-          }
-          if (
-            this.remoteVoiceStream &&
-            this.remoteVoiceStream.getAudioTracks().some((t) => t.id === track.id)
-          ) {
-            this.remoteVoiceStream.removeTrack(track)
-            if (this.remoteVoiceStream.getAudioTracks().length === 0) {
-              this.remoteVoiceStream = null
-            }
-            this.emitStreamsUpdated()
-            this.emitCallState()
-          }
-        }
+      this.routeRemoteTrack(event.track)
+      event.track.onunmute = () => {
+        this.routeRemoteTrack(event.track)
       }
     }
 
@@ -610,6 +485,135 @@ export class MsnWebRTCService {
 
     this.peerConnection = pc
     return pc
+  }
+
+  private routeRemoteTrack(track: MediaStreamTrack): void {
+    if (!track || track.readyState === 'ended') return
+
+    if (track.kind === 'audio') {
+      const isExplicitScreenAudio = Boolean(
+        this.remoteStreamIds.screenStreamId &&
+          track.id === this.remoteStreamIds.screenStreamId
+      )
+      const isExplicitMic = Boolean(
+        this.remoteStreamIds.micStreamId &&
+          track.id === this.remoteStreamIds.micStreamId
+      )
+      const audioLabel = track.label.toLowerCase()
+      const isScreenAudioLabel =
+        audioLabel.includes('screen') ||
+        audioLabel.includes('system') ||
+        audioLabel.includes('loopback') ||
+        audioLabel.includes('desktop')
+
+      const isScreenAudio = !isExplicitMic && (isExplicitScreenAudio || isScreenAudioLabel)
+
+      if (isScreenAudio) {
+        if (!this.remoteScreenStream) {
+          this.remoteScreenStream = new MediaStream()
+        }
+        if (!this.remoteScreenStream.getAudioTracks().some((t) => t.id === track.id)) {
+          this.remoteScreenStream.addTrack(track)
+        }
+      } else {
+        if (!this.remoteVoiceStream || !this.remoteVoiceStream.getAudioTracks().some((t) => t.id === track.id)) {
+          this.remoteVoiceStream = new MediaStream([track])
+          this.setupRemoteVoiceAnalyser(this.remoteVoiceStream)
+        }
+      }
+    } else if (track.kind === 'video') {
+      const isExplicitScreenId = Boolean(
+        this.remoteStreamIds.screenStreamId &&
+          track.id === this.remoteStreamIds.screenStreamId
+      )
+      const isExplicitCamId = Boolean(
+        this.remoteStreamIds.camStreamId &&
+          track.id === this.remoteStreamIds.camStreamId
+      )
+      const labelLower = track.label.toLowerCase()
+      const isExplicitScreenLabel =
+        labelLower.includes('screen') ||
+        labelLower.includes('window') ||
+        labelLower.includes('display') ||
+        labelLower.includes('desktop')
+
+      const isScreenVideo = !isExplicitCamId && (isExplicitScreenId || isExplicitScreenLabel)
+
+      if (isScreenVideo) {
+        if (!this.remoteScreenStream) {
+          this.remoteScreenStream = new MediaStream()
+        }
+        if (!this.remoteScreenStream.getVideoTracks().some((t) => t.id === track.id)) {
+          this.remoteScreenStream
+            .getVideoTracks()
+            .filter((t) => t.id !== track.id)
+            .forEach((t) => this.remoteScreenStream?.removeTrack(t))
+          this.remoteScreenStream.addTrack(track)
+        }
+      } else {
+        if (!this.remoteCamStream || !this.remoteCamStream.getVideoTracks().some((t) => t.id === track.id)) {
+          this.remoteCamStream = new MediaStream([track])
+        }
+      }
+    }
+
+    track.onended = () => {
+      if (track.kind === 'video') {
+        if (
+          this.remoteScreenStream &&
+          this.remoteScreenStream.getVideoTracks().some((t) => t.id === track.id)
+        ) {
+          this.remoteScreenStream.removeTrack(track)
+          if (this.remoteScreenStream.getVideoTracks().length === 0) {
+            this.remoteScreenStream = null
+          }
+          this.emitStreamsUpdated()
+          this.emitCallState()
+        }
+        if (
+          this.remoteCamStream &&
+          this.remoteCamStream.getVideoTracks().some((t) => t.id === track.id)
+        ) {
+          this.remoteCamStream.removeTrack(track)
+          if (this.remoteCamStream.getVideoTracks().length === 0) {
+            this.remoteCamStream = null
+          }
+          this.emitStreamsUpdated()
+          this.emitCallState()
+        }
+      } else if (track.kind === 'audio') {
+        if (
+          this.remoteScreenStream &&
+          this.remoteScreenStream.getAudioTracks().some((t) => t.id === track.id)
+        ) {
+          this.remoteScreenStream.removeTrack(track)
+        }
+        if (
+          this.remoteVoiceStream &&
+          this.remoteVoiceStream.getAudioTracks().some((t) => t.id === track.id)
+        ) {
+          this.remoteVoiceStream.removeTrack(track)
+          if (this.remoteVoiceStream.getAudioTracks().length === 0) {
+            this.remoteVoiceStream = null
+          }
+          this.emitStreamsUpdated()
+          this.emitCallState()
+        }
+      }
+    }
+
+    this.emitStreamsUpdated()
+    this.emitCallState()
+  }
+
+  private syncRemoteStreamsFromReceivers(): void {
+    if (!this.peerConnection) return
+    for (const receiver of this.peerConnection.getReceivers()) {
+      const track = receiver.track
+      if (track && track.readyState === 'live') {
+        this.routeRemoteTrack(track)
+      }
+    }
   }
 
   public async connectDataChannelOnly(): Promise<void> {
@@ -913,12 +917,13 @@ export class MsnWebRTCService {
     this.emitCallState()
 
     await this.acquireMicAndCam(withVideo)
+
+    // Sempre recria uma conexão P2P WebRTC 100% limpa ao entrar na Sala
+    this.resetPeerConnection()
     const pc = this.ensurePeerConnection()
 
-    if (!this.dataChannel) {
-      const dc = pc.createDataChannel('msn-p2p-data', { ordered: true })
-      this.setupDataChannel(dc)
-    }
+    const dc = pc.createDataChannel('msn-p2p-data', { ordered: true })
+    this.setupDataChannel(dc)
 
     this.attachLocalStreamsToPeer(pc)
     await this.ensureTransceiversSendRecv(pc)
@@ -946,6 +951,31 @@ export class MsnWebRTCService {
     })
   }
 
+  public async publishRoomBroadcast(): Promise<void> {
+    if (!this.inCall || !this.localCamStream) return
+    this.resetPeerConnection()
+    const pc = this.ensurePeerConnection()
+
+    const dc = pc.createDataChannel('msn-p2p-data', { ordered: true })
+    this.setupDataChannel(dc)
+
+    this.attachLocalStreamsToPeer(pc)
+    await this.ensureTransceiversSendRecv(pc)
+    this.broadcastStreamMeta()
+
+    const offer = await pc.createOffer({
+      offerToReceiveAudio: true,
+      offerToReceiveVideo: true
+    })
+    await this.setLocalDescriptionSafe(pc, offer)
+    await this.sendSignal('sdp-offer', {
+      sdp: pc.localDescription,
+      isMediaCall: true,
+      inRoom: true,
+      streamIds: this.getLocalStreamIds()
+    })
+  }
+
   public async acceptIncomingCall(): Promise<void> {
     await this.startCall(true)
   }
@@ -956,31 +986,29 @@ export class MsnWebRTCService {
     const camTrack = this.localCamStream?.getVideoTracks()[0]
 
     if (micTrack) {
-      const alreadySendingAudio = pc
-        .getSenders()
-        .some((s) => s.track && s.track.id === micTrack.id)
       const audioTransceiver = transceivers.find(
-        (t) => t.receiver.track?.kind === 'audio' && (!t.sender.track || t.direction === 'recvonly')
+        (t) => t.receiver.track?.kind === 'audio'
       )
       if (audioTransceiver) {
-        await audioTransceiver.sender.replaceTrack(micTrack).catch(() => {})
+        if (audioTransceiver.sender.track?.id !== micTrack.id) {
+          await audioTransceiver.sender.replaceTrack(micTrack).catch(() => {})
+        }
         audioTransceiver.direction = 'sendrecv'
-      } else if (!alreadySendingAudio && this.localMicStream) {
+      } else if (this.localMicStream) {
         pc.addTrack(micTrack, this.localMicStream)
       }
     }
 
     if (camTrack) {
-      const alreadySendingVideo = pc
-        .getSenders()
-        .some((s) => s.track && s.track.id === camTrack.id)
       const videoTransceiver = transceivers.find(
-        (t) => t.receiver.track?.kind === 'video' && (!t.sender.track || t.direction === 'recvonly')
+        (t) => t.receiver.track?.kind === 'video'
       )
       if (videoTransceiver) {
-        await videoTransceiver.sender.replaceTrack(camTrack).catch(() => {})
+        if (videoTransceiver.sender.track?.id !== camTrack.id) {
+          await videoTransceiver.sender.replaceTrack(camTrack).catch(() => {})
+        }
         videoTransceiver.direction = 'sendrecv'
-      } else if (!alreadySendingVideo && this.localCamStream) {
+      } else if (this.localCamStream) {
         pc.addTrack(camTrack, this.localCamStream)
       }
     }
@@ -991,12 +1019,16 @@ export class MsnWebRTCService {
     this.pendingOffer = null
     this.incomingCallFrom = null
     this.setRemoteVoiceBoostVolume(this.remoteVoiceVolumePercent)
-    this.cleanupMediaStreams()
+    this.cleanupLocalMediaStreams()
+    this.remoteVoiceStream = null
+    this.remoteCamStream = null
+    this.remoteScreenStream = null
     this.remoteStreamIds = {
       micStreamId: null,
       camStreamId: null,
       screenStreamId: null
     }
+    this.resetPeerConnection()
     this.trackPresenceState()
     this.sendDataChannelPacket({
       type: 'room-state',
@@ -1313,7 +1345,7 @@ export class MsnWebRTCService {
 
     if (type === 'room-sync-request') {
       if (this.inCall) {
-        this.renegotiatePeerConnection().catch(() => {})
+        this.publishRoomBroadcast().catch(() => {})
       }
       return
     }
@@ -1326,29 +1358,20 @@ export class MsnWebRTCService {
         this.friendInRoom = true
       }
 
-      // Na Sala Sempre Existente: aceita automaticamente a oferta WebRTC!
-      const pc = this.ensurePeerConnection()
-      const isPolite = this.myUser === 'Vitinho'
-      const offerCollision = pc.signalingState !== 'stable'
-
-      if (offerCollision) {
-        if (!isPolite) {
-          console.warn('[WebRTC] Colisão de oferta evitada: peer impolítico ignorando oferta concorrente')
-          return
-        }
-        console.log('[WebRTC] Colisão de oferta: peer político realizando rollback...')
-        try {
-          await pc.setLocalDescription({ type: 'rollback' })
-        } catch (err) {
-          console.warn('[WebRTC] Erro no rollback:', err)
-        }
+      // Se recebemos um novo sdp-offer e a conexão existente não está estável, reinicia limpo
+      if (type === 'sdp-offer' && this.peerConnection && this.peerConnection.signalingState !== 'stable') {
+        console.log('[WebRTC] Resetando peerConnection para aceitar nova oferta limpa...')
+        this.resetPeerConnection()
       }
 
+      const pc = this.ensurePeerConnection()
       if (this.inCall) {
         this.attachLocalStreamsToPeer(pc)
       }
       await pc.setRemoteDescription(new RTCSessionDescription(sdp))
       await this.flushPendingIceCandidates(pc)
+      this.syncRemoteStreamsFromReceivers()
+
       if (this.inCall) {
         await this.ensureTransceiversSendRecv(pc)
       }
@@ -1360,6 +1383,7 @@ export class MsnWebRTCService {
         inRoom: this.inCall,
         streamIds: this.getLocalStreamIds()
       })
+      this.syncRemoteStreamsFromReceivers()
       this.emitStreamsUpdated()
       this.emitCallState()
       return
@@ -1370,6 +1394,9 @@ export class MsnWebRTCService {
       if (this.peerConnection && this.peerConnection.signalingState === 'have-local-offer') {
         await this.peerConnection.setRemoteDescription(new RTCSessionDescription(sdp))
         await this.flushPendingIceCandidates(this.peerConnection)
+        this.syncRemoteStreamsFromReceivers()
+        this.emitStreamsUpdated()
+        this.emitCallState()
       }
       return
     }
@@ -1390,39 +1417,29 @@ export class MsnWebRTCService {
     }
 
     if (type === 'hangup') {
-      // O amigo saiu da Sala: limpamos streams remotas e resetamos IDs
+      // O amigo saiu da Sala: limpamos streams remotas e resetamos a conexão
       this.friendInRoom = false
-      if (this.remoteVoiceStream) {
-        this.remoteVoiceStream.getTracks().forEach((t) => {
-          try {
-            t.stop()
-          } catch {}
-        })
-        this.remoteVoiceStream = null
-      }
-      if (this.remoteCamStream) {
-        this.remoteCamStream.getVideoTracks().forEach((t) => {
-          try {
-            t.stop()
-          } catch {}
-        })
-        this.remoteCamStream = null
-      }
-      if (this.remoteScreenStream) {
-        this.remoteScreenStream.getTracks().forEach((t) => {
-          try {
-            t.stop()
-          } catch {}
-        })
-        this.remoteScreenStream = null
-      }
+      this.remoteVoiceStream = null
+      this.remoteCamStream = null
+      this.remoteScreenStream = null
       this.remoteStreamIds = {
         micStreamId: null,
         camStreamId: null,
         screenStreamId: null
       }
+      this.resetPeerConnection()
       this.emitStreamsUpdated()
       this.emitCallState()
+
+      // Se nós ainda estamos na Sala, enviamos um novo broadcast da nossa câmera
+      // para continuar aparecendo no avatar do amigo fora da sala!
+      if (this.inCall && this.localCamStream) {
+        setTimeout(() => {
+          if (this.inCall) {
+            this.publishRoomBroadcast().catch(() => {})
+          }
+        }, 200)
+      }
     }
   }
 
@@ -1780,6 +1797,9 @@ export class MsnWebRTCService {
    */
   public setRemoteVoiceBoostVolume(volumePercent: number): void {
     this.remoteVoiceVolumePercent = volumePercent
+    if (this.audioCtx && this.audioCtx.state === 'suspended') {
+      this.audioCtx.resume().catch(() => {})
+    }
     if (!this.remoteVoiceGainNode || !this.audioCtx) return
     const gainValue = this.inCall
       ? Math.max(0, Math.min(2, volumePercent / 100))
@@ -1880,11 +1900,34 @@ export class MsnWebRTCService {
   }
 
   public sendDataChannelPacket(packet: DataChannelPacket): boolean {
+    let sent = false
     if (this.dataChannel && this.dataChannel.readyState === 'open') {
-      this.dataChannel.send(JSON.stringify(packet))
-      return true
+      try {
+        this.dataChannel.send(JSON.stringify(packet))
+        sent = true
+      } catch (err) {
+        console.warn('[DataChannel] Erro ao enviar pacote via RTCDataChannel:', err)
+      }
     }
-    return false
+
+    // Fallback garantido via Supabase Realtime Broadcast para todos os pacotes de controle/chat/sala
+    if (!sent && packet.type !== 'file-chunk') {
+      if (this.realtimeChannel) {
+        this.realtimeChannel
+          .send({
+            type: 'broadcast',
+            event: 'msn-packet',
+            payload: {
+              sender: this.myUser,
+              target: this.friendUser,
+              packet
+            }
+          })
+          .catch(() => {})
+        return true
+      }
+    }
+    return sent
   }
 
   private handleDataChannelPacket(packet: DataChannelPacket): void {
@@ -2250,30 +2293,9 @@ export class MsnWebRTCService {
 
   private cleanupMediaStreams(): void {
     this.cleanupLocalMediaStreams()
-    if (this.remoteVoiceStream) {
-      this.remoteVoiceStream.getTracks().forEach((t) => {
-        try {
-          t.stop()
-        } catch {}
-      })
-      this.remoteVoiceStream = null
-    }
-    if (this.remoteCamStream) {
-      this.remoteCamStream.getVideoTracks().forEach((t) => {
-        try {
-          t.stop()
-        } catch {}
-      })
-      this.remoteCamStream = null
-    }
-    if (this.remoteScreenStream) {
-      this.remoteScreenStream.getTracks().forEach((t) => {
-        try {
-          t.stop()
-        } catch {}
-      })
-      this.remoteScreenStream = null
-    }
+    this.remoteVoiceStream = null
+    this.remoteCamStream = null
+    this.remoteScreenStream = null
   }
 
   private emitStreamsUpdated(): void {
