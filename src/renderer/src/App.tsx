@@ -172,8 +172,7 @@ const MainMsnMessengerWindow: React.FC = () => {
   const [friendVoiceVolume, setFriendVoiceVolume] = useState<number>(100)
   const [screenMovieVolume, setScreenMovieVolume] = useState<number>(85)
 
-  // Laser Pointer Neon Temporário (1.5s) e Auto-Hide UI (3s) na Tela 4
-  const [laserPoints, setLaserPoints] = useState<LaserPointerPoint[]>([])
+  // Auto-Hide UI (3s) no Modo Cinema
   const [cinemaControlsVisible, setCinemaControlsVisible] = useState<boolean>(true)
   const autoHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -221,8 +220,8 @@ const MainMsnMessengerWindow: React.FC = () => {
   })
 
   const remoteVoiceAudioRef = useRef<HTMLAudioElement | null>(null)
-  const localCamVideoRef = useRef<HTMLVideoElement | null>(null)
-  const remoteCamVideoRef = useRef<HTMLVideoElement | null>(null)
+  const localCamElementsRef = useRef<Set<HTMLVideoElement>>(new Set())
+  const remoteCamElementsRef = useRef<Set<HTMLVideoElement>>(new Set())
   const remoteScreenVideoRef = useRef<HTMLVideoElement | null>(null)
   const chatEndRef = useRef<HTMLDivElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
@@ -387,22 +386,33 @@ const MainMsnMessengerWindow: React.FC = () => {
 
     // Se a janela estiver minimizada/oculta no System Tray ou em Modo Eco sem foco, desconecta o srcObject dos <video>
     if (!isWindowVisible) {
-      if (localCamVideoRef.current) localCamVideoRef.current.srcObject = null
-      if (remoteCamVideoRef.current) remoteCamVideoRef.current.srcObject = null
+      for (const el of localCamElementsRef.current) {
+        if (el.isConnected) el.srcObject = null
+      }
+      for (const el of remoteCamElementsRef.current) {
+        if (el.isConnected) el.srcObject = null
+      }
       if (remoteScreenVideoRef.current) remoteScreenVideoRef.current.srcObject = null
       return
     }
 
-    // Restaura instantaneamente ao focar/mostrar a janela
-    if (localCamVideoRef.current && localCamVideoRef.current.srcObject !== st.localCam) {
-      localCamVideoRef.current.srcObject = st.localCam
-      localCamVideoRef.current.play().catch(() => {})
-    }
-    if (remoteCamVideoRef.current && remoteCamVideoRef.current.srcObject !== st.remoteCam) {
-      remoteCamVideoRef.current.srcObject = st.remoteCam
-      remoteCamVideoRef.current.play().catch(() => {})
+    // Restaura TODOS os vídeos de câmera local conectados no DOM
+    for (const el of localCamElementsRef.current) {
+      if (el.isConnected && el.srcObject !== st.localCam) {
+        el.srcObject = st.localCam
+        el.play().catch(() => {})
+      }
     }
 
+    // Restaura TODOS os vídeos de câmera remota conectados no DOM (avatar, sala 1x1, modo cinema)
+    for (const el of remoteCamElementsRef.current) {
+      if (el.isConnected && el.srcObject !== st.remoteCam) {
+        el.srcObject = st.remoteCam
+        el.play().catch(() => {})
+      }
+    }
+
+    // Vídeo da Tela Compartilhada (Modo Cinema)
     const activeScreenStream = st.remoteScreen || st.localScreen
     if (
       remoteScreenVideoRef.current &&
@@ -415,11 +425,20 @@ const MainMsnMessengerWindow: React.FC = () => {
 
   const bindLocalCamRef = useCallback(
     (el: HTMLVideoElement | null) => {
-      localCamVideoRef.current = el
-      if (el && isWindowVisible && streamsRef.current.localCam) {
-        if (el.srcObject !== streamsRef.current.localCam) {
-          el.srcObject = streamsRef.current.localCam
-          el.play().catch(() => {})
+      if (el) {
+        localCamElementsRef.current.add(el)
+        if (isWindowVisible && streamsRef.current.localCam) {
+          if (el.srcObject !== streamsRef.current.localCam) {
+            el.srcObject = streamsRef.current.localCam
+            el.play().catch(() => {})
+          }
+        }
+      } else {
+        for (const video of localCamElementsRef.current) {
+          if (!video.isConnected) {
+            video.srcObject = null
+            localCamElementsRef.current.delete(video)
+          }
         }
       }
     },
@@ -428,11 +447,20 @@ const MainMsnMessengerWindow: React.FC = () => {
 
   const bindRemoteCamRef = useCallback(
     (el: HTMLVideoElement | null) => {
-      remoteCamVideoRef.current = el
-      if (el && isWindowVisible && streamsRef.current.remoteCam) {
-        if (el.srcObject !== streamsRef.current.remoteCam) {
-          el.srcObject = streamsRef.current.remoteCam
-          el.play().catch(() => {})
+      if (el) {
+        remoteCamElementsRef.current.add(el)
+        if (isWindowVisible && streamsRef.current.remoteCam) {
+          if (el.srcObject !== streamsRef.current.remoteCam) {
+            el.srcObject = streamsRef.current.remoteCam
+            el.play().catch(() => {})
+          }
+        }
+      } else {
+        for (const video of remoteCamElementsRef.current) {
+          if (!video.isConnected) {
+            video.srcObject = null
+            remoteCamElementsRef.current.delete(video)
+          }
         }
       }
     },
@@ -548,12 +576,6 @@ const MainMsnMessengerWindow: React.FC = () => {
             })
           }
         ])
-      },
-      onLaserPointer: (point) => {
-        setLaserPoints((prev) => [...prev, point])
-        setTimeout(() => {
-          setLaserPoints((prev) => prev.filter((p) => p.id !== point.id))
-        }, 1500)
       },
       onSoundboardWink: (sender, winkId, label) => {
         soundManager.playSoundboardWink(winkId)
@@ -859,28 +881,6 @@ const MainMsnMessengerWindow: React.FC = () => {
       sessionUser: loggedInUser,
       ecoMode: next
     })
-  }
-
-  // Clique no vídeo da tela compartilhada para disparar Laser Pointer Neon (1.5s)
-  const handleScreenVideoClick = (e: React.MouseEvent<HTMLDivElement>): void => {
-    if (!loggedInUser || !webrtcRef.current) return
-    const rect = e.currentTarget.getBoundingClientRect()
-    const x = (e.clientX - rect.left) / rect.width
-    const y = (e.clientY - rect.top) / rect.height
-
-    const myPoint: LaserPointerPoint = {
-      id: `local-${Date.now()}`,
-      x,
-      y,
-      sender: loggedInUser,
-      createdAt: Date.now()
-    }
-    setLaserPoints((prev) => [...prev, myPoint])
-    setTimeout(() => {
-      setLaserPoints((prev) => prev.filter((p) => p.id !== myPoint.id))
-    }, 1500)
-
-    webrtcRef.current.sendLaserPointer(x, y)
   }
 
   // Auto-Hide UI após 3 segundos sem mexer o mouse no Modo Cinema (Tela 4)
@@ -1514,8 +1514,7 @@ const MainMsnMessengerWindow: React.FC = () => {
           {isCinemaScreenMode ? (
             <div
               onMouseMove={handleCinemaMouseMove}
-              onClick={handleScreenVideoClick}
-              className="relative w-full h-full bg-black overflow-hidden select-none cursor-crosshair"
+              className="relative w-full h-full bg-black overflow-hidden select-none cursor-default"
             >
               {/* Compartilhamento de Tela em Tela Cheia ao Fundo */}
               <video
@@ -1526,23 +1525,6 @@ const MainMsnMessengerWindow: React.FC = () => {
                 muted={isScreenSharing}
                 className="w-full h-full object-contain bg-black"
               />
-
-              {/* Indicadores Neon Temporários (1.5s) do Laser Pointer */}
-              {laserPoints.map((pt) => (
-                <div
-                  key={pt.id}
-                  style={{
-                    left: `${pt.x * 100}%`,
-                    top: `${pt.y * 100}%`
-                  }}
-                  className="pointer-events-none absolute -translate-x-1/2 -translate-y-1/2 z-30"
-                >
-                  <div className="w-7 h-7 rounded-full bg-lime-400/40 border-2 border-[#76ff03] shadow-[0_0_18px_#76ff03] animate-ping" />
-                  <span className="mt-1 px-1.5 py-0.5 rounded bg-black/80 text-[#76ff03] text-[10px] font-bold block whitespace-nowrap">
-                    🎯 {pt.sender}
-                  </span>
-                </div>
-              ))}
 
               {/* Câmera 1 no Canto Superior (Arrastável / Draggable): Minha Câmera Full Widescreen (sem corte quadrado) */}
               <div
