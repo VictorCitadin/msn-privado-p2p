@@ -103,6 +103,11 @@ export type DataChannelPacket =
       inRoom: boolean
     }
   | {
+      type: 'chat-history-sync'
+      sender: MsnUser
+      messages: ChatMessageItem[]
+    }
+  | {
       type: 'file-start'
       transferId: string
       sender: MsnUser
@@ -139,6 +144,8 @@ export interface WebRTCCallbacks {
     justLoggedIn: boolean
   ) => void
   onChatMessage: (msg: ChatMessageItem) => void
+  onChatHistorySync?: (messages: ChatMessageItem[]) => void
+  onDataChannelOpen?: () => void
   onNudgeReceived: (sender: MsnUser) => void
   onLaserPointer: (point: LaserPointerPoint) => void
   onSoundboardWink: (sender: MsnUser, winkId: SoundboardWinkId, label: string) => void
@@ -217,8 +224,10 @@ export class MsnWebRTCService {
   private friendInRoom = false
   private friendLastStatus: PresenceStatus = 'offline'
   private myStatus: PresenceStatus = 'online'
-  private mySubnick = 'Disponível no MSN Privado 🎮'
+  private mySubnick = ''
   private ecoMode = false
+  private preferredAudioDeviceId = ''
+  private preferredVideoDeviceId = ''
 
   // Web Audio API para Boost de Voz até 200%, Cancelamento Digital de Loopback e Detecção de Voz (Auto-Ducking DJ Bot)
   private audioCtx: AudioContext | null = null
@@ -299,7 +308,8 @@ export class MsnWebRTCService {
           if (friendPresences && friendPresences.length > 0) {
             const latest = friendPresences[0]
             const newStatus: PresenceStatus = latest.status || 'online'
-            const newSubnick = latest.subnick || 'Online'
+            const rawSub = latest.subnick === 'Disponível no MSN Privado 🎮' ? '' : latest.subnick
+            const newSubnick = rawSub || ''
             const justLoggedIn = this.friendLastStatus === 'offline' && newStatus !== 'offline'
             this.friendLastStatus = newStatus
             if (typeof latest.inRoom === 'boolean') {
@@ -642,39 +652,161 @@ export class MsnWebRTCService {
   // 5. CHAMADAS DE VOZ, VÍDEO (1x1) E COMPARTILHAMENTO DE TELA (ZERO ECO)
   // ==========================================================================
   private async acquireMicAndCam(withVideo: boolean): Promise<void> {
-    // 1. Track do Microfone em MediaStream exclusivo (com try/catch individual para nunca travar o Atender)
+    // 1. Track do Microfone em MediaStream exclusivo (com suporte a dispositivo escolhido pelo usuário)
     if (!this.localMicStream) {
       try {
-        this.localMicStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true
-          },
-          video: false
-        })
+        const audioConstraints: MediaTrackConstraints = {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          ...(this.preferredAudioDeviceId
+            ? { deviceId: { exact: this.preferredAudioDeviceId } }
+            : {})
+        }
+        try {
+          this.localMicStream = await navigator.mediaDevices.getUserMedia({
+            audio: audioConstraints,
+            video: false
+          })
+        } catch {
+          this.localMicStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            },
+            video: false
+          })
+        }
         this.setupLocalVoiceAnalyser(this.localMicStream)
       } catch (err) {
         console.warn('[WebRTC] Microfone indisponível ou em uso, seguindo chamada:', err)
       }
     }
 
-    // 2. Track da Webcam em MediaStream separado em resolução natural full da câmera (sem corte quadrado)
+    // 2. Track da Webcam em MediaStream separado SEMPRE em resolução natural full 1280x720@30fps (sem zoom e sem travar)
     if (withVideo && !this.localCamStream) {
       try {
-        const isCompact = this.ecoMode || Boolean(this.localScreenStream)
-        this.localCamStream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: { ideal: isCompact ? 640 : 1280 },
-            height: { ideal: isCompact ? 360 : 720 },
-            frameRate: { ideal: isCompact ? 24 : 30 }
-          },
-          audio: false
-        })
+        const videoConstraints: MediaTrackConstraints = {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30 },
+          ...(this.preferredVideoDeviceId
+            ? { deviceId: { exact: this.preferredVideoDeviceId } }
+            : {})
+        }
+        try {
+          this.localCamStream = await navigator.mediaDevices.getUserMedia({
+            video: videoConstraints,
+            audio: false
+          })
+        } catch {
+          this.localCamStream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+              frameRate: { ideal: 30 }
+            },
+            audio: false
+          })
+        }
       } catch (err) {
         console.warn('[WebRTC] Webcam indisponível ou em uso, seguindo chamada apenas com áudio/recepção:', err)
       }
     }
+  }
+
+  public async setPreferredDevices(audioDeviceId: string, videoDeviceId: string): Promise<void> {
+    const audioChanged = audioDeviceId !== this.preferredAudioDeviceId
+    const videoChanged = videoDeviceId !== this.preferredVideoDeviceId
+    this.preferredAudioDeviceId = audioDeviceId
+    this.preferredVideoDeviceId = videoDeviceId
+
+    if (!this.inCall) return
+
+    const pc = this.peerConnection
+    const wasMuted = this.isMicrophoneMuted()
+    const wasCamEnabled = this.localCamStream?.getVideoTracks()[0]?.enabled ?? true
+
+    if (audioChanged) {
+      try {
+        const newMicStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            ...(audioDeviceId ? { deviceId: { exact: audioDeviceId } } : {})
+          },
+          video: false
+        })
+        const newAudioTrack = newMicStream.getAudioTracks()[0]
+        if (newAudioTrack) {
+          newAudioTrack.enabled = !wasMuted
+          const oldAudioTrack = this.localMicStream?.getAudioTracks()[0]
+          if (pc) {
+            const audioSender = pc
+              .getSenders()
+              .find(
+                (s) =>
+                  s.track?.kind === 'audio' &&
+                  (!oldAudioTrack || s.track.id === oldAudioTrack.id)
+              )
+            if (audioSender) {
+              await audioSender.replaceTrack(newAudioTrack)
+            } else {
+              pc.addTrack(newAudioTrack, newMicStream)
+            }
+          }
+          this.localMicStream?.getTracks().forEach((t) => t.stop())
+          this.localMicStream = newMicStream
+          this.setupLocalVoiceAnalyser(newMicStream)
+        }
+      } catch (err) {
+        console.warn('[WebRTC] Erro ao trocar microfone ao vivo:', err)
+      }
+    }
+
+    if (videoChanged) {
+      try {
+        const newCamStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 30 },
+            ...(videoDeviceId ? { deviceId: { exact: videoDeviceId } } : {})
+          },
+          audio: false
+        })
+        const newVideoTrack = newCamStream.getVideoTracks()[0]
+        if (newVideoTrack) {
+          newVideoTrack.enabled = wasCamEnabled
+          const oldVideoTrack = this.localCamStream?.getVideoTracks()[0]
+          const screenTrackId = this.localScreenStream?.getVideoTracks()[0]?.id
+          if (pc) {
+            const videoSender = pc
+              .getSenders()
+              .find(
+                (s) =>
+                  s.track?.kind === 'video' &&
+                  s.track.id !== screenTrackId &&
+                  (!oldVideoTrack || s.track.id === oldVideoTrack.id)
+              )
+            if (videoSender) {
+              await videoSender.replaceTrack(newVideoTrack)
+            } else {
+              pc.addTrack(newVideoTrack, newCamStream)
+            }
+          }
+          this.localCamStream?.getTracks().forEach((t) => t.stop())
+          this.localCamStream = newCamStream
+        }
+      } catch (err) {
+        console.warn('[WebRTC] Erro ao trocar webcam ao vivo:', err)
+      }
+    }
+
+    this.broadcastStreamMeta()
+    this.emitStreamsUpdated()
   }
 
   public async startCall(withVideo = true): Promise<void> {
@@ -887,22 +1019,23 @@ export class MsnWebRTCService {
   }
 
   /**
-   * Ajusta dinamicamente a resolução da webcam para 320x320 @ 24fps no Modo Jogo / Modo Cinema
+   * Mantém a câmera sempre em resolução nativa fluida (1280x720 @ 30fps) sem zoom e sem travar,
+   * tanto no Modo Jogo OFF quanto no Modo Jogo ON.
    */
   public async setEcoMode(enabled: boolean): Promise<void> {
     this.ecoMode = enabled
-    await this.applySmartCornerCameraConstraints(enabled || Boolean(this.localScreenStream))
+    await this.applySmartCornerCameraConstraints(false)
   }
 
-  private async applySmartCornerCameraConstraints(compactMode: boolean): Promise<void> {
+  private async applySmartCornerCameraConstraints(_compactMode: boolean): Promise<void> {
     const camTrack = this.localCamStream?.getVideoTracks()[0]
     if (!camTrack) return
 
     try {
       await camTrack.applyConstraints({
-        width: { ideal: compactMode ? 640 : 1280 },
-        height: { ideal: compactMode ? 360 : 720 },
-        frameRate: { ideal: compactMode ? 24 : 30 }
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        frameRate: { ideal: 30 }
       })
     } catch (err) {
       console.warn('[WebRTC] Falha ao aplicar constraints inteligentes na câmera:', err)
@@ -1523,6 +1656,7 @@ export class MsnWebRTCService {
         sender: this.myUser,
         inRoom: this.inCall
       })
+      this.callbacks.onDataChannelOpen?.()
     }
 
     channel.onmessage = (event) => {
@@ -1553,6 +1687,12 @@ export class MsnWebRTCService {
           imageDataUrl: packet.imageDataUrl,
           timestamp: packet.timestamp
         })
+        break
+
+      case 'chat-history-sync':
+        if (Array.isArray(packet.messages)) {
+          this.callbacks.onChatHistorySync?.(packet.messages)
+        }
         break
 
       case 'nudge':
@@ -1703,6 +1843,25 @@ export class MsnWebRTCService {
     })
 
     return msg
+  }
+
+  public sendChatHistorySync(messages: ChatMessageItem[]): void {
+    const clean = messages
+      .filter((m) => !m.isSystem && !m.fileAttachment)
+      .slice(-80)
+      .map((m) => ({
+        id: m.id,
+        sender: m.sender,
+        text: m.text,
+        imageDataUrl: m.imageDataUrl,
+        timestamp: m.timestamp
+      }))
+    if (clean.length === 0) return
+    this.sendDataChannelPacket({
+      type: 'chat-history-sync',
+      sender: this.myUser,
+      messages: clean
+    })
   }
 
   /**

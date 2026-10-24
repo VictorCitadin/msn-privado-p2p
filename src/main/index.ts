@@ -13,8 +13,9 @@ import {
 } from 'electron'
 import { join, extname } from 'path'
 import { createServer, Server as HttpServer } from 'http'
-import { existsSync } from 'fs'
+import { existsSync, copyFileSync } from 'fs'
 import { readFile } from 'fs/promises'
+import { execFile } from 'child_process'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { autoUpdater } from 'electron-updater'
 import Store from 'electron-store'
@@ -75,10 +76,22 @@ export interface AlbumRankingRecord {
   updated_at?: string
 }
 
+export interface StoredChatMessage {
+  id: string
+  sender: 'Vitinho' | 'Will'
+  text?: string
+  imageDataUrl?: string
+  isSystem?: boolean
+  timestamp: string
+}
+
 interface StoreSchema {
   sessionUser: 'Vitinho' | 'Will' | null
   subnick: string
   ecoMode: boolean
+  audioDeviceId: string
+  videoDeviceId: string
+  chatMessages: StoredChatMessage[]
   albumRankings: Record<string, AlbumRankingRecord>
 }
 
@@ -86,8 +99,11 @@ const store = new Store<StoreSchema>({
   name: 'msn-privado-config',
   defaults: {
     sessionUser: null,
-    subnick: 'Disponível no MSN Privado 🎮',
+    subnick: '',
     ecoMode: false,
+    audioDeviceId: '',
+    videoDeviceId: '',
+    chatMessages: [],
     albumRankings: {}
   }
 })
@@ -216,27 +232,103 @@ const MSN_2000S_ICON_PNG64 =
 const MSN_2000S_ICON_PNG32 =
   'data:image/png;base64,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'
 
-function createMsnTrayIcon(): Electron.NativeImage {
-  const candidatePaths = [
-    join(process.resourcesPath || '', 'app.asar.unpacked', 'resources', 'icon.ico'),
-    join(process.resourcesPath || '', 'resources', 'icon.ico'),
-    join(__dirname, '../../resources/icon.ico'),
-    join(__dirname, '../../build/icon.ico')
+function resolveBundledIconPath(fileName: 'icon.ico' | 'tray.ico'): string | null {
+  const candidates = [
+    join(process.resourcesPath || '', 'app.asar.unpacked', 'resources', fileName),
+    join(process.resourcesPath || '', 'resources', fileName),
+    join(__dirname, `../../resources/${fileName}`),
+    join(__dirname, `../../build/${fileName}`)
   ]
-  for (const p of candidatePaths) {
+  for (const p of candidates) {
+    if (existsSync(p)) return p
+  }
+  return null
+}
+
+function getFreshUserDataIconPath(kind: 'app' | 'tray'): string | null {
+  try {
+    const src = resolveBundledIconPath(kind === 'tray' ? 'tray.ico' : 'icon.ico')
+    if (!src) return null
+    const dest = join(
+      app.getPath('userData'),
+      kind === 'tray' ? 'vitinho-will-tray-v3.ico' : 'vitinho-will-icon-v3.ico'
+    )
+    copyFileSync(src, dest)
+    return dest
+  } catch {
+    return resolveBundledIconPath(kind === 'tray' ? 'tray.ico' : 'icon.ico')
+  }
+}
+
+function createMsnTrayIcon(): Electron.NativeImage {
+  const icoPath = getFreshUserDataIconPath('app') || resolveBundledIconPath('icon.ico')
+  if (icoPath) {
     try {
-      if (existsSync(p)) {
-        const img = nativeImage.createFromPath(p)
-        if (!img.isEmpty()) return img
-      }
+      const img = nativeImage.createFromPath(icoPath)
+      if (!img.isEmpty()) return img
     } catch {}
   }
   return nativeImage.createFromDataURL(MSN_2000S_ICON_PNG64)
 }
 
-function createMsnTraySmallIcon(): Electron.NativeImage {
+function createMsnTraySmallIcon(): Electron.NativeImage | string {
+  const trayIcoPath = getFreshUserDataIconPath('tray') || resolveBundledIconPath('tray.ico')
+  if (trayIcoPath) {
+    return trayIcoPath
+  }
   const img = nativeImage.createFromDataURL(MSN_2000S_ICON_PNG32)
   return img.resize({ width: 16, height: 16 })
+}
+
+function repairWindowsShortcutsAndTrayCache(): void {
+  if (process.platform !== 'win32' || is.dev) return
+  const appIcoPath = getFreshUserDataIconPath('app')
+  if (!appIcoPath) return
+
+  const exePath = process.execPath
+  const psScript = `
+    $ErrorActionPreference = 'SilentlyContinue'
+    $exePath = '${exePath.replace(/'/g, "''")}'
+    $icoPath = '${appIcoPath.replace(/'/g, "''")}'
+
+    # 1. Remove entrada de bandeja corrompida/vazia do cache do Windows 11 (se nao tiver IconSnapshot)
+    Get-ChildItem 'HKCU:\\Control Panel\\NotifyIconSettings' | ForEach-Object {
+      $p = Get-ItemProperty $_.PSPath
+      if ($p.ExecutablePath -like '*MSNMessengerPrivado.exe*' -and -not $p.IconSnapshot) {
+        Remove-Item $_.PSPath -Recurse -Force
+      }
+    }
+
+    # 2. Atualiza atalhos do Menu Iniciar e Area de Trabalho para 'Vitinho e Will' com icone anos 2000 dedicado
+    $startMenuDir = [Environment]::GetFolderPath('Programs')
+    $desktopDir = [Environment]::GetFolderPath('Desktop')
+    $oldStart = Join-Path $startMenuDir 'MSN Messenger Privado (Vitinho & Will).lnk'
+    $oldDesktop = Join-Path $desktopDir 'MSN Messenger Privado (Vitinho & Will).lnk'
+    if (Test-Path $oldStart) { Remove-Item $oldStart -Force }
+    if (Test-Path $oldDesktop) { Remove-Item $oldDesktop -Force }
+
+    $wsh = New-Object -ComObject WScript.Shell
+    foreach ($dir in @($startMenuDir, $desktopDir)) {
+      $lnkPath = Join-Path $dir 'Vitinho e Will.lnk'
+      $s = $wsh.CreateShortcut($lnkPath)
+      $s.TargetPath = $exePath
+      $s.WorkingDirectory = Split-Path $exePath
+      $s.IconLocation = "$icoPath,0"
+      $s.Description = 'Vitinho e Will'
+      $s.Save()
+    }
+  `
+
+  execFile(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', psScript],
+    () => {
+      const trayIco = createMsnTraySmallIcon()
+      try {
+        tray?.setImage(trayIco)
+      } catch {}
+    }
+  )
 }
 
 // ============================================================================
@@ -532,6 +624,14 @@ async function openAlbumRankerWindow(): Promise<void> {
 function setupSystemTray(): void {
   const icon = createMsnTraySmallIcon()
   tray = new Tray(icon)
+  try {
+    tray.setImage(icon)
+  } catch {}
+  setTimeout(() => {
+    try {
+      tray?.setImage(createMsnTraySmallIcon())
+    } catch {}
+  }, 800)
   tray.setToolTip('Vitinho e Will')
 
   const contextMenu = Menu.buildFromTemplate([
@@ -842,24 +942,65 @@ async function resolveDjBotTrack(queryOrUrl: string): Promise<{
 // 10. HANDLERS IPC E AUTO-UPDATER
 // ============================================================================
 function registerIpcHandlers(): void {
-  // Sessão e Configurações Locais
+  // Sessão, Histórico de Mensagens e Dispositivos Locais
   ipcMain.handle('store:get-session', () => {
+    let savedSubnick = store.get('subnick') || ''
+    if (savedSubnick === 'Disponível no MSN Privado 🎮') {
+      savedSubnick = ''
+      store.set('subnick', '')
+    }
     return {
       sessionUser: store.get('sessionUser'),
-      subnick: store.get('subnick'),
-      ecoMode: store.get('ecoMode')
+      subnick: savedSubnick,
+      ecoMode: store.get('ecoMode'),
+      audioDeviceId: store.get('audioDeviceId') || '',
+      videoDeviceId: store.get('videoDeviceId') || '',
+      chatMessages: store.get('chatMessages') || []
     }
   })
 
   ipcMain.handle(
     'store:set-session',
-    (_event, payload: { sessionUser: 'Vitinho' | 'Will' | null; subnick?: string; ecoMode?: boolean }) => {
-      store.set('sessionUser', payload.sessionUser)
-      if (typeof payload.subnick === 'string') store.set('subnick', payload.subnick)
+    (
+      _event,
+      payload: {
+        sessionUser: 'Vitinho' | 'Will' | null
+        subnick?: string
+        ecoMode?: boolean
+        audioDeviceId?: string
+        videoDeviceId?: string
+      }
+    ) => {
+      if (payload.sessionUser !== undefined) {
+        store.set('sessionUser', payload.sessionUser)
+      }
+      if (typeof payload.subnick === 'string') {
+        const cleanSub = payload.subnick === 'Disponível no MSN Privado 🎮' ? '' : payload.subnick
+        store.set('subnick', cleanSub)
+      }
       if (typeof payload.ecoMode === 'boolean') store.set('ecoMode', payload.ecoMode)
+      if (typeof payload.audioDeviceId === 'string')
+        store.set('audioDeviceId', payload.audioDeviceId)
+      if (typeof payload.videoDeviceId === 'string')
+        store.set('videoDeviceId', payload.videoDeviceId)
       return true
     }
   )
+
+  ipcMain.handle('store:save-chat-messages', (_event, messages: StoredChatMessage[]) => {
+    if (Array.isArray(messages)) {
+      const sanitized = messages.slice(-300).map((m) => ({
+        id: m.id,
+        sender: m.sender,
+        text: m.text,
+        imageDataUrl: m.imageDataUrl,
+        isSystem: m.isSystem,
+        timestamp: m.timestamp
+      }))
+      store.set('chatMessages', sanitized)
+    }
+    return true
+  })
 
   // Abrir a Segunda Janela Dedicada do Rankeador de Álbuns (1080x760)
   ipcMain.handle('open-album-ranker', () => {
@@ -1252,6 +1393,7 @@ if (!gotSingleInstanceLock) {
     setupAutoUpdater()
     createMainWindow()
     setupSystemTray()
+    repairWindowsShortcutsAndTrayCache()
     registerGlobalShortcuts()
 
     app.on('activate', () => {
@@ -1262,6 +1404,10 @@ if (!gotSingleInstanceLock) {
 
 app.on('before-quit', () => {
   isQuitting = true
+  try {
+    tray?.destroy()
+    tray = null
+  } catch {}
 })
 
 app.on('will-quit', () => {

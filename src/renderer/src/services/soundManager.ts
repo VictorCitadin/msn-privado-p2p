@@ -4,7 +4,15 @@
  * Suporta arquivos em /src/renderer/src/assets/sounds/*.mp3 com síntese fiel integrada dos acordes clássicos do MSN.
  */
 
-export type MsnSoundEffect = 'login' | 'message' | 'nudge' | 'ring' | 'mute' | 'unmute'
+export type MsnSoundEffect =
+  | 'login'
+  | 'message'
+  | 'nudge'
+  | 'ring'
+  | 'mute'
+  | 'unmute'
+  | 'room-join'
+  | 'room-leave'
 
 export type SoundboardWinkId = 'msn-wink' | 'headshot' | 'gg-ez' | 'airhorn' | 'drumroll'
 
@@ -81,6 +89,20 @@ class SoundManager {
           this.playToneSequence(ctx, [
             { freq: 360, duration: 0.08, type: 'sine', gain: 0.25 },
             { freq: 640, duration: 0.12, type: 'sine', gain: 0.25 }
+          ])
+          break
+        case 'room-join':
+          this.playToneSequence(ctx, [
+            { freq: 523.25, duration: 0.09, type: 'sine', gain: 0.28 }, // C5
+            { freq: 659.25, duration: 0.09, type: 'sine', gain: 0.3 }, // E5
+            { freq: 783.99, duration: 0.14, type: 'sine', gain: 0.32 } // G5
+          ])
+          break
+        case 'room-leave':
+          this.playToneSequence(ctx, [
+            { freq: 783.99, duration: 0.09, type: 'sine', gain: 0.26 }, // G5
+            { freq: 587.33, duration: 0.09, type: 'sine', gain: 0.25 }, // D5
+            { freq: 440.0, duration: 0.15, type: 'sine', gain: 0.24 } // A4
           ])
           break
       }

@@ -19,7 +19,9 @@ import {
   Download,
   ShieldCheck,
   Maximize2,
-  Minimize2
+  Minimize2,
+  Settings,
+  X
 } from 'lucide-react'
 import {
   MsnWebRTCService,
@@ -117,12 +119,14 @@ const MainMsnMessengerWindow: React.FC = () => {
   // ESTADOS DO MSN MESSENGER (TELA 2, 3, 4 e 5)
   // ==========================================================================
   const [myStatus, setMyStatus] = useState<PresenceStatus>('online')
-  const [customSubnick, setCustomSubnick] = useState<string>('Disponível no MSN Privado 🎮')
+  const [customSubnick, setCustomSubnick] = useState<string>('')
   const [musicSubnick, setMusicSubnick] = useState<string | null>(null)
   const [friendStatus, setFriendStatus] = useState<PresenceStatus>('offline')
-  const [friendSubnick, setFriendSubnick] = useState<string>('Offline')
+  const [friendSubnick, setFriendSubnick] = useState<string>('')
 
   const [messages, setMessages] = useState<ChatMessageItem[]>([])
+  const messagesLoadedRef = useRef<boolean>(false)
+  const messagesRef = useRef<ChatMessageItem[]>([])
   const [chatInput, setChatInput] = useState<string>('')
   const [fileProgress, setFileProgress] = useState<{
     fileName: string
@@ -130,6 +134,13 @@ const MainMsnMessengerWindow: React.FC = () => {
     direction: 'sending' | 'receiving'
   } | null>(null)
   const [isDraggingOverChat, setIsDraggingOverChat] = useState<boolean>(false)
+
+  // Dispositivos de Microfone e Webcam selecionáveis (antes ou durante a ligação)
+  const [deviceModalOpen, setDeviceModalOpen] = useState<boolean>(false)
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([])
+  const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([])
+  const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState<string>('')
+  const [selectedVideoDeviceId, setSelectedVideoDeviceId] = useState<string>('')
 
   // Estados de Sala Sempre Existente (Tela 3) e Compartilhamento de Tela Modo Cinema (Tela 4)
   const [inCall, setInCall] = useState<boolean>(false)
@@ -212,8 +223,40 @@ const MainMsnMessengerWindow: React.FC = () => {
     : customSubnick
 
   // ==========================================================================
-  // 1. CARREGAR SESSÃO SALVA, VERSÃO DO APP E EVENTOS DO ELECTRON MAIN
+  // 1. CARREGAR SESSÃO SALVA, HISTÓRICO DE MENSAGENS, DISPOSITIVOS E EVENTOS
   // ==========================================================================
+  const refreshMediaDevices = useCallback(async (unlockLabels = false) => {
+    try {
+      let list = await navigator.mediaDevices.enumerateDevices()
+      const hasEmptyLabels = list.some(
+        (d) => (d.kind === 'audioinput' || d.kind === 'videoinput') && !d.label
+      )
+      if (unlockLabels && hasEmptyLabels) {
+        try {
+          const tempStream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+            video: true
+          })
+          tempStream.getTracks().forEach((t) => t.stop())
+          list = await navigator.mediaDevices.enumerateDevices()
+        } catch {
+          try {
+            const tempAudio = await navigator.mediaDevices.getUserMedia({
+              audio: true,
+              video: false
+            })
+            tempAudio.getTracks().forEach((t) => t.stop())
+            list = await navigator.mediaDevices.enumerateDevices()
+          } catch {}
+        }
+      }
+      setAudioDevices(list.filter((d) => d.kind === 'audioinput'))
+      setVideoDevices(list.filter((d) => d.kind === 'videoinput'))
+    } catch (err) {
+      console.warn('[Devices] Erro ao listar dispositivos de áudio/vídeo:', err)
+    }
+  }, [])
+
   useEffect(() => {
     window.msnApi.getAppVersion().then(setAppVersion).catch(() => {})
 
@@ -224,15 +267,35 @@ const MainMsnMessengerWindow: React.FC = () => {
           setLoggedInUser(saved.sessionUser)
           setSelectedLoginUser(saved.sessionUser)
         }
-        if (saved.subnick) setCustomSubnick(saved.subnick)
+        if (typeof saved.subnick === 'string') {
+          const clean =
+            saved.subnick === 'Disponível no MSN Privado 🎮' ? '' : saved.subnick
+          setCustomSubnick(clean)
+        }
         if (typeof saved.ecoMode === 'boolean') setEcoMode(saved.ecoMode)
+        if (typeof saved.audioDeviceId === 'string')
+          setSelectedAudioDeviceId(saved.audioDeviceId)
+        if (typeof saved.videoDeviceId === 'string')
+          setSelectedVideoDeviceId(saved.videoDeviceId)
+        if (Array.isArray(saved.chatMessages) && saved.chatMessages.length > 0) {
+          setMessages(saved.chatMessages)
+          messagesRef.current = saved.chatMessages
+        }
+        messagesLoadedRef.current = true
       })
       .catch(() => {
+        messagesLoadedRef.current = true
         const localUser = localStorage.getItem('msn_session_user') as MsnUser | null
         if (localUser === 'Vitinho' || localUser === 'Will') {
           setLoggedInUser(localUser)
         }
       })
+
+    refreshMediaDevices(false)
+    const onDeviceChange = (): void => {
+      refreshMediaDevices(false)
+    }
+    navigator.mediaDevices?.addEventListener?.('devicechange', onDeviceChange)
 
     const unsubVisibility = window.msnApi.onWindowVisibilityChanged((visible) => {
       setIsWindowVisible(visible)
@@ -252,11 +315,49 @@ const MainMsnMessengerWindow: React.FC = () => {
     })
 
     return () => {
+      navigator.mediaDevices?.removeEventListener?.('devicechange', onDeviceChange)
       unsubVisibility()
       unsubUpdater()
       unsubFullscreen()
     }
-  }, [])
+  }, [refreshMediaDevices])
+
+  // Auto-esconde a mensagem "Você já está na versão mais recente..." ou de erro após 4 segundos
+  useEffect(() => {
+    if (updaterInfo.status === 'up-to-date' || updaterInfo.status === 'error') {
+      const timer = setTimeout(() => {
+        setUpdaterInfo({ status: 'idle', message: '' })
+      }, 4000)
+      return () => clearTimeout(timer)
+    }
+    return undefined
+  }, [updaterInfo])
+
+  // Salva automaticamente o histórico de mensagens no electron-store sempre que mudar
+  useEffect(() => {
+    messagesRef.current = messages
+    if (!messagesLoadedRef.current) return
+    window.msnApi.saveChatMessages(messages).catch(() => {})
+  }, [messages])
+
+  // Toca som ao alguém entrar na Sala de ligação e som ao alguém sair da Sala
+  const prevInCallRef = useRef<boolean>(false)
+  const prevFriendInRoomRef = useRef<boolean>(false)
+  useEffect(() => {
+    const myJoined = !prevInCallRef.current && inCall
+    const myLeft = prevInCallRef.current && !inCall
+    const friendJoined = !prevFriendInRoomRef.current && friendInRoom
+    const friendLeft = prevFriendInRoomRef.current && !friendInRoom
+
+    prevInCallRef.current = inCall
+    prevFriendInRoomRef.current = friendInRoom
+
+    if (myJoined || friendJoined) {
+      soundManager.play('room-join')
+    } else if (myLeft || friendLeft) {
+      soundManager.play('room-leave')
+    }
+  }, [inCall, friendInRoom])
 
   // ==========================================================================
   // 2. CONGELAMENTO DE RENDERIZAÇÃO DE VÍDEO QUANDO MINIMIZADO/OCULTO (0% GPU)
@@ -402,7 +503,23 @@ const MainMsnMessengerWindow: React.FC = () => {
       },
       onChatMessage: (msg) => {
         soundManager.play('message')
-        setMessages((prev) => [...prev, msg])
+        setMessages((prev) => {
+          if (prev.some((m) => m.id === msg.id)) return prev
+          return [...prev, msg]
+        })
+      },
+      onChatHistorySync: (remoteMsgs) => {
+        setMessages((prev) => {
+          const existingIds = new Set(prev.map((m) => m.id))
+          const missing = remoteMsgs.filter((m) => m?.id && !existingIds.has(m.id))
+          if (missing.length === 0) return prev
+          return [...prev, ...missing].slice(-300)
+        })
+      },
+      onDataChannelOpen: () => {
+        if (messagesRef.current.length > 0) {
+          service.sendChatHistorySync(messagesRef.current)
+        }
       },
       onNudgeReceived: (sender) => {
         soundManager.play('nudge')
@@ -492,6 +609,7 @@ const MainMsnMessengerWindow: React.FC = () => {
 
     webrtcRef.current = service
     service.setEcoMode(ecoMode)
+    service.setPreferredDevices(selectedAudioDeviceId, selectedVideoDeviceId).catch(() => {})
 
     // Atalho Global Ctrl+Shift+M para mutar microfone durante jogos em tela cheia com bip sonoro
     const unsubMute = window.msnApi.onGlobalMuteShortcut(() => {
@@ -694,7 +812,25 @@ const MainMsnMessengerWindow: React.FC = () => {
     ])
   }
 
-  // Alternar Modo Jogo (Eco Mode: 320x320@24fps + economia de GPU)
+  const handleSelectAudioDevice = async (deviceId: string): Promise<void> => {
+    setSelectedAudioDeviceId(deviceId)
+    await webrtcRef.current?.setPreferredDevices(deviceId, selectedVideoDeviceId)
+    await window.msnApi.setSession({
+      sessionUser: loggedInUser,
+      audioDeviceId: deviceId
+    })
+  }
+
+  const handleSelectVideoDevice = async (deviceId: string): Promise<void> => {
+    setSelectedVideoDeviceId(deviceId)
+    await webrtcRef.current?.setPreferredDevices(selectedAudioDeviceId, deviceId)
+    await window.msnApi.setSession({
+      sessionUser: loggedInUser,
+      videoDeviceId: deviceId
+    })
+  }
+
+  // Alternar Modo Jogo (OFF = padrão, ON = economiza GPU de animações em segundo plano mantendo câmera fluida sem zoom)
   const handleToggleEcoMode = async (): Promise<void> => {
     const next = !ecoMode
     setEcoMode(next)
@@ -968,6 +1104,92 @@ const MainMsnMessengerWindow: React.FC = () => {
         }}
       />
 
+      {/* MODAL DE CONFIGURAÇÃO DE MICROFONE E WEBCAM */}
+      {deviceModalOpen && (
+        <div
+          onClick={() => setDeviceModalOpen(false)}
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md bg-white rounded-2xl border-2 border-[#7da2ce] shadow-2xl overflow-hidden"
+          >
+            <div className="msn-header-gradient px-4 py-3 text-white flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Settings className="w-4 h-4 text-sky-200" />
+                <span className="text-xs font-extrabold tracking-wide">
+                  Configurar Microfone e Webcam
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDeviceModalOpen(false)}
+                className="p-1 rounded hover:bg-white/20 text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-4 space-y-4 text-xs text-slate-800">
+              <div>
+                <label className="block font-extrabold text-[#164273] mb-1">
+                  🎤 Dispositivo de Microfone:
+                </label>
+                <select
+                  value={selectedAudioDeviceId}
+                  onChange={(e) => handleSelectAudioDevice(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-[#f4f9ff] border border-[#7da2ce] font-semibold text-slate-900 focus:outline-none focus:border-[#2664a5]"
+                >
+                  <option value="">Padrão do Sistema</option>
+                  {audioDevices.map((dev, idx) => (
+                    <option key={dev.deviceId || idx} value={dev.deviceId}>
+                      {dev.label || `Microfone ${idx + 1}`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block font-extrabold text-[#164273] mb-1">
+                  📹 Dispositivo de Webcam:
+                </label>
+                <select
+                  value={selectedVideoDeviceId}
+                  onChange={(e) => handleSelectVideoDevice(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-[#f4f9ff] border border-[#7da2ce] font-semibold text-slate-900 focus:outline-none focus:border-[#2664a5]"
+                >
+                  <option value="">Padrão do Sistema</option>
+                  {videoDevices.map((dev, idx) => (
+                    <option key={dev.deviceId || idx} value={dev.deviceId}>
+                      {dev.label || `Webcam ${idx + 1}`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="flex items-center justify-between pt-2 border-t border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => refreshMediaDevices(true)}
+                  className="msn-btn-aero px-3 py-1.5 rounded-lg font-bold text-[#164273] flex items-center gap-1.5"
+                >
+                  <RefreshCw className="w-3.5 h-3.5 text-[#2664a5]" />
+                  <span>Atualizar Lista</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setDeviceModalOpen(false)}
+                  className="px-4 py-1.5 rounded-lg bg-gradient-to-b from-[#4b91d1] to-[#1d528d] text-white font-extrabold shadow"
+                >
+                  Concluído
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ==================================================================== */}
       {/* CABEÇALHO E SUBNICK MUSICAL (OCULTADO EM TELA CHEIA NA LIGAÇÃO)      */}
       {/* ==================================================================== */}
@@ -999,9 +1221,11 @@ const MainMsnMessengerWindow: React.FC = () => {
                     : 'Offline'}
               </span>
             </div>
-            <div className="text-xs text-sky-100 truncate">
-              {friendSubnick}
-            </div>
+            {friendSubnick && friendSubnick !== 'Offline' && (
+              <div className="text-xs text-sky-100 truncate">
+                {friendSubnick}
+              </div>
+            )}
           </div>
         </div>
 
@@ -1026,9 +1250,14 @@ const MainMsnMessengerWindow: React.FC = () => {
               type="text"
               value={musicSubnick ? `🎵 Ouvindo: ${musicSubnick}` : customSubnick}
               disabled={Boolean(musicSubnick)}
-              onChange={(e) => setCustomSubnick(e.target.value)}
-              className="bg-transparent text-white text-xs w-44 truncate focus:outline-none"
-              title="Seu subnick no MSN (muda automaticamente quando o DJ Bot toca)"
+              placeholder="Digite um recado..."
+              onChange={(e) => {
+                const val = e.target.value
+                setCustomSubnick(val)
+                window.msnApi.setSession({ sessionUser: loggedInUser, subnick: val }).catch(() => {})
+              }}
+              className="bg-transparent text-white placeholder-sky-200/60 text-xs w-44 truncate focus:outline-none"
+              title="Seu recado/subnick (muda automaticamente quando o DJ Bot toca)"
             />
           </div>
 
@@ -1147,20 +1376,34 @@ const MainMsnMessengerWindow: React.FC = () => {
             <span>Rankeador de Álbuns</span>
           </button>
 
-          {/* 6. Modo Jogo (Eco Mode) */}
+          {/* 6. Configurar Microfone e Webcam */}
+          <button
+            type="button"
+            onClick={() => {
+              refreshMediaDevices(true)
+              setDeviceModalOpen(true)
+            }}
+            className="msn-btn-aero px-2.5 py-1.5 rounded-lg text-xs font-bold text-[#164273] flex items-center gap-1.5"
+            title="Alterar dispositivo de Microfone e Webcam"
+          >
+            <Settings className="w-4 h-4 text-[#2664a5]" />
+            <span>Mic / Webcam</span>
+          </button>
+
+          {/* 7. Modo Jogo (OFF / ON) */}
           <button
             type="button"
             onClick={handleToggleEcoMode}
             className={`msn-btn-aero px-2.5 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 ${
               ecoMode ? 'ring-2 ring-[#52b700] text-[#285e00]' : 'text-[#164273]'
             }`}
-            title="Reduz câmeras para 320x320@24fps e otimiza memória para zero queda de FPS"
+            title="Modo Jogo: economiza recursos em segundo plano mantendo a câmera fluida e sem zoom"
           >
             <Gamepad2 className="w-4 h-4 text-purple-700" />
-            <span>Modo Jogo {ecoMode ? '(ON)' : '(Eco)'}</span>
+            <span>Modo Jogo: {ecoMode ? 'ON' : 'OFF'}</span>
           </button>
 
-          {/* 7. Verificar Atualização */}
+          {/* 8. Verificar Atualização */}
           <button
             type="button"
             onClick={() => window.msnApi.checkForUpdates()}
@@ -1393,6 +1636,18 @@ const MainMsnMessengerWindow: React.FC = () => {
                     )}
                   </button>
 
+                  <button
+                    type="button"
+                    onClick={() => {
+                      refreshMediaDevices(true)
+                      setDeviceModalOpen(true)
+                    }}
+                    className="p-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-600"
+                    title="Trocar dispositivo de Microfone ou Webcam"
+                  >
+                    <Settings className="w-4 h-4 text-sky-300" />
+                  </button>
+
                   {/* Slider 1: Volume da Voz do Amigo (Boost Web Audio API até 200%) */}
                   <div className="flex items-center gap-2 px-2 border-l border-slate-700">
                     <span className="text-[11px] font-bold text-sky-300 whitespace-nowrap">
@@ -1595,6 +1850,18 @@ const MainMsnMessengerWindow: React.FC = () => {
                   title="Ligar / Desligar Câmera"
                 >
                   {isCamEnabled ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    refreshMediaDevices(true)
+                    setDeviceModalOpen(true)
+                  }}
+                  className="p-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-600"
+                  title="Trocar dispositivo de Microfone ou Webcam"
+                >
+                  <Settings className="w-4 h-4 text-sky-300" />
                 </button>
 
                 <button

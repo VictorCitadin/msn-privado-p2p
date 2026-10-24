@@ -48,19 +48,36 @@ export interface AlbumRankingRecord {
   updated_at?: string
 }
 
+export interface StoredChatMessage {
+  id: string
+  sender: 'Vitinho' | 'Will'
+  text?: string
+  imageDataUrl?: string
+  isSystem?: boolean
+  timestamp: string
+}
+
 const msnApi = {
-  // Sessão local
+  // Sessão local, dispositivos e histórico de mensagens
   getSession: (): Promise<{
     sessionUser: 'Vitinho' | 'Will' | null
     subnick: string
     ecoMode: boolean
+    audioDeviceId: string
+    videoDeviceId: string
+    chatMessages: StoredChatMessage[]
   }> => ipcRenderer.invoke('store:get-session'),
 
   setSession: (payload: {
-    sessionUser: 'Vitinho' | 'Will' | null
+    sessionUser?: 'Vitinho' | 'Will' | null
     subnick?: string
     ecoMode?: boolean
+    audioDeviceId?: string
+    videoDeviceId?: string
   }): Promise<boolean> => ipcRenderer.invoke('store:set-session', payload),
+
+  saveChatMessages: (messages: StoredChatMessage[]): Promise<boolean> =>
+    ipcRenderer.invoke('store:save-chat-messages', messages),
 
   // Janela do Rankeador de Álbuns (1080x760)
   openAlbumRanker: (): Promise<boolean> => ipcRenderer.invoke('open-album-ranker'),

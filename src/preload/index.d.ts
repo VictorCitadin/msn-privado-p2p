@@ -3,7 +3,8 @@ import type {
   DesktopSourceItem,
   AlbumTrackItem,
   AlbumSearchResult,
-  AlbumRankingRecord
+  AlbumRankingRecord,
+  StoredChatMessage
 } from './index'
 
 export interface MsnBridgeApi {
@@ -11,12 +12,18 @@ export interface MsnBridgeApi {
     sessionUser: 'Vitinho' | 'Will' | null
     subnick: string
     ecoMode: boolean
+    audioDeviceId: string
+    videoDeviceId: string
+    chatMessages: StoredChatMessage[]
   }>
   setSession: (payload: {
-    sessionUser: 'Vitinho' | 'Will' | null
+    sessionUser?: 'Vitinho' | 'Will' | null
     subnick?: string
     ecoMode?: boolean
+    audioDeviceId?: string
+    videoDeviceId?: string
   }) => Promise<boolean>
+  saveChatMessages: (messages: StoredChatMessage[]) => Promise<boolean>
   openAlbumRanker: () => Promise<boolean>
   toggleFullscreen: () => Promise<boolean>
   setFullscreen: (fullscreen: boolean) => Promise<boolean>
