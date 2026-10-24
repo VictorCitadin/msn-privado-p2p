@@ -1,0 +1,1456 @@
+import { createClient, RealtimeChannel, SupabaseClient } from '@supabase/supabase-js'
+import { SoundboardWinkId } from './soundManager'
+
+export type MsnUser = 'Vitinho' | 'Will'
+export type PresenceStatus = 'online' | 'busy' | 'offline'
+
+export interface ChatMessageItem {
+  id: string
+  sender: MsnUser
+  text?: string
+  imageDataUrl?: string
+  fileAttachment?: {
+    fileName: string
+    fileSize: number
+    mimeType: string
+    blobUrl: string
+  }
+  isSystem?: boolean
+  timestamp: string
+}
+
+export interface DjTrackItem {
+  id: string
+  videoId: string
+  title: string
+  author: string
+  durationSeconds: number
+  thumbnail: string
+  addedBy: MsnUser
+}
+
+export interface DjSyncState {
+  playlist: DjTrackItem[]
+  currentIndex: number
+  isPlaying: boolean
+  currentTime: number
+  updatedBy: MsnUser
+  updatedAt: number
+}
+
+export interface LaserPointerPoint {
+  id: string
+  x: number // 0..1 relativo ao vídeo
+  y: number // 0..1 relativo ao vídeo
+  sender: MsnUser
+  createdAt: number
+}
+
+export type DataChannelPacket =
+  | {
+      type: 'chat-message'
+      id: string
+      sender: MsnUser
+      text?: string
+      imageDataUrl?: string
+      timestamp: string
+    }
+  | {
+      type: 'nudge'
+      sender: MsnUser
+      timestamp: string
+    }
+  | {
+      type: 'laser-pointer'
+      sender: MsnUser
+      x: number
+      y: number
+    }
+  | {
+      type: 'soundboard-wink'
+      sender: MsnUser
+      winkId: SoundboardWinkId
+      label: string
+    }
+  | {
+      type: 'subnick-update'
+      sender: MsnUser
+      subnick: string
+      status: PresenceStatus
+    }
+  | {
+      type: 'dj-sync'
+      state: DjSyncState
+    }
+  | {
+      type: 'album-ranked'
+      user: MsnUser
+      albumId: string
+      albumName: string
+      artistName: string
+      rating: number
+    }
+  | {
+      type: 'stream-meta'
+      sender: MsnUser
+      micStreamId: string | null
+      camStreamId: string | null
+      screenStreamId: string | null
+    }
+  | {
+      type: 'file-start'
+      transferId: string
+      sender: MsnUser
+      fileName: string
+      fileSize: number
+      mimeType: string
+      totalChunks: number
+    }
+  | {
+      type: 'file-chunk'
+      transferId: string
+      chunkIndex: number
+      dataBase64: string
+    }
+  | {
+      type: 'file-end'
+      transferId: string
+    }
+
+interface IncomingFileBuffer {
+  sender: MsnUser
+  fileName: string
+  fileSize: number
+  mimeType: string
+  totalChunks: number
+  chunks: string[]
+  receivedCount: number
+}
+
+export interface WebRTCCallbacks {
+  onFriendPresenceChange: (
+    status: PresenceStatus,
+    subnick: string,
+    justLoggedIn: boolean
+  ) => void
+  onChatMessage: (msg: ChatMessageItem) => void
+  onNudgeReceived: (sender: MsnUser) => void
+  onLaserPointer: (point: LaserPointerPoint) => void
+  onSoundboardWink: (sender: MsnUser, winkId: SoundboardWinkId, label: string) => void
+  onDjSync: (state: DjSyncState) => void
+  onAlbumRankedNotification: (payload: {
+    user: MsnUser
+    albumId: string
+    albumName: string
+    artistName: string
+    rating: number
+  }) => void
+  onCallStateChange: (state: {
+    inCall: boolean
+    incomingCallFrom: MsnUser | null
+    isScreenSharing: boolean
+    remoteScreenSharing: boolean
+  }) => void
+  onStreamsUpdated: (streams: {
+    localCam: MediaStream | null
+    localScreen: MediaStream | null
+    remoteVoice: MediaStream | null
+    remoteCam: MediaStream | null
+    remoteScreen: MediaStream | null
+  }) => void
+  onVoiceActivityChange: (isAnyoneSpeaking: boolean) => void
+  onFileProgress: (info: {
+    fileName: string
+    percent: number
+    direction: 'sending' | 'receiving'
+  } | null) => void
+}
+
+/**
+ * Serviço P2P WebRTC Completo — Ultra-Lightweight Gaming Edition
+ * - Codec H.264 Hardware (NVENC / QuickSync / AMF)
+ * - SDP Munging 10 Mbps @ 60fps para Tela + Opus 510 kbps Stereo CBR para Filme
+ * - Separação estrita de tracks de Microfone vs Áudio do Sistema (Zero Eco)
+ * - Boost de Voz até 200% via Web Audio API + Auto-Ducking de 70% para o DJ Bot
+ */
+export class MsnWebRTCService {
+  private myUser: MsnUser
+  private friendUser: MsnUser
+  private callbacks: WebRTCCallbacks
+
+  private supabase: SupabaseClient | null = null
+  private realtimeChannel: RealtimeChannel | null = null
+  private peerConnection: RTCPeerConnection | null = null
+  private dataChannel: RTCDataChannel | null = null
+
+  // Streams Locais Separados
+  private localMicStream: MediaStream | null = null
+  private localCamStream: MediaStream | null = null
+  private localScreenStream: MediaStream | null = null
+
+  // Streams Remotos Separados
+  private remoteVoiceStream: MediaStream | null = null
+  private remoteCamStream: MediaStream | null = null
+  private remoteScreenStream: MediaStream | null = null
+
+  // Mapeamento de Stream IDs do amigo para separar Voz, Câmera e Tela com 100% de precisão
+  private remoteStreamIds: {
+    micStreamId: string | null
+    camStreamId: string | null
+    screenStreamId: string | null
+  } = {
+    micStreamId: null,
+    camStreamId: null,
+    screenStreamId: null
+  }
+
+  private pendingOffer: RTCSessionDescriptionInit | null = null
+  private pendingIceCandidates: RTCIceCandidateInit[] = []
+  private incomingCallFrom: MsnUser | null = null
+  private inCall = false
+  private friendLastStatus: PresenceStatus = 'offline'
+  private myStatus: PresenceStatus = 'online'
+  private mySubnick = 'Disponível no MSN Privado 🎮'
+  private ecoMode = false
+
+  // Web Audio API para Boost de Voz até 200% e Detecção de Voz (Auto-Ducking DJ Bot)
+  private audioCtx: AudioContext | null = null
+  private remoteVoiceGainNode: GainNode | null = null
+  private vadInterval: ReturnType<typeof setInterval> | null = null
+  private localAnalyser: AnalyserNode | null = null
+  private remoteAnalyser: AnalyserNode | null = null
+  private silenceTimeout: ReturnType<typeof setTimeout> | null = null
+  private currentlySpeaking = false
+
+  // Buffer de recepção de arquivos P2P
+  private incomingFiles: Map<string, IncomingFileBuffer> = new Map()
+
+  constructor(myUser: MsnUser, callbacks: WebRTCCallbacks) {
+    this.myUser = myUser
+    this.friendUser = myUser === 'Vitinho' ? 'Will' : 'Vitinho'
+    this.callbacks = callbacks
+    this.initSignaling()
+  }
+
+  // ==========================================================================
+  // 1. CONFIGURAÇÃO DE SERVIDORES ICE (STUN GOOGLE/CLOUDFLARE + TURN .ENV)
+  // ==========================================================================
+  private getIceServers(): RTCIceServer[] {
+    const servers: RTCIceServer[] = [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' }
+    ]
+
+    const turnUrl = import.meta.env.VITE_TURN_URL
+    const turnUsername = import.meta.env.VITE_TURN_USERNAME
+    const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL
+
+    if (turnUrl && turnUsername && turnCredential) {
+      servers.push({
+        urls: turnUrl.split(',').map((u: string) => u.trim()),
+        username: turnUsername,
+        credential: turnCredential
+      })
+    }
+
+    return servers
+  }
+
+  // ==========================================================================
+  // 2. SINALIZAÇÃO E PRESENÇA (SUPABASE REALTIME + VERCEL API FALLBACK)
+  // ==========================================================================
+  private initSignaling(): void {
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || ''
+    const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY || ''
+
+    if (supabaseUrl && supabaseKey) {
+      this.supabase = createClient(supabaseUrl, supabaseKey)
+      this.realtimeChannel = this.supabase.channel('msn-vitinho-will', {
+        config: {
+          presence: { key: this.myUser },
+          broadcast: { self: false }
+        }
+      })
+
+      this.realtimeChannel
+        .on('presence', { event: 'sync' }, () => {
+          const state = this.realtimeChannel?.presenceState() || {}
+          const friendPresences = state[this.friendUser] as
+            | Array<{ status?: PresenceStatus; subnick?: string }>
+            | undefined
+
+          if (friendPresences && friendPresences.length > 0) {
+            const latest = friendPresences[0]
+            const newStatus: PresenceStatus = latest.status || 'online'
+            const newSubnick = latest.subnick || 'Online no MSN'
+            const justLoggedIn = this.friendLastStatus === 'offline' && newStatus !== 'offline'
+            this.friendLastStatus = newStatus
+            this.callbacks.onFriendPresenceChange(newStatus, newSubnick, justLoggedIn)
+
+            // Se a conexão de dados P2P ainda não estiver aberta e formos o Vitinho, inicia P2P silencioso para chat/arquivos
+            if (!this.peerConnection && this.myUser === 'Vitinho') {
+              this.connectDataChannelOnly().catch(() => {})
+            }
+          } else {
+            this.friendLastStatus = 'offline'
+            this.callbacks.onFriendPresenceChange('offline', 'Offline', false)
+          }
+        })
+        .on('broadcast', { event: 'webrtc-signal' }, async ({ payload }) => {
+          if (!payload || payload.target !== this.myUser) return
+          await this.handleIncomingSignal(payload.sender, payload.type, payload.data)
+        })
+        .subscribe(async (status) => {
+          if (status === 'SUBSCRIBED') {
+            await this.realtimeChannel?.track({
+              user: this.myUser,
+              status: this.myStatus,
+              subnick: this.mySubnick,
+              online_at: new Date().toISOString()
+            })
+          }
+        })
+    }
+  }
+
+  private async sendSignal(
+    type: 'sdp-offer' | 'sdp-answer' | 'ice-candidate' | 'hangup' | 'renegotiate-offer',
+    data: Record<string, unknown>
+  ): Promise<void> {
+    // 1. Envia instantaneamente via WebSocket do Supabase Realtime Broadcast
+    if (this.realtimeChannel) {
+      await this.realtimeChannel.send({
+        type: 'broadcast',
+        event: 'webrtc-signal',
+        payload: {
+          sender: this.myUser,
+          target: this.friendUser,
+          type,
+          data
+        }
+      })
+    }
+
+    // 2. Envia em paralelo para a API Serverless da Vercel (/api/signal) se configurada
+    const vercelApiUrl = import.meta.env.VITE_VERCEL_API_URL
+    if (vercelApiUrl && !vercelApiUrl.includes('seu-projeto')) {
+      fetch(`${vercelApiUrl.replace(/\/$/, '')}/api/signal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roomId: 'msn-vitinho-will',
+          sender: this.myUser,
+          target: this.friendUser,
+          type,
+          payload: data
+        })
+      }).catch(() => {})
+    }
+  }
+
+  // ==========================================================================
+  // 3. CRIAÇÃO DO RTCPeerConnection E SEPARAÇÃO DE TRACKS
+  // ==========================================================================
+  private ensurePeerConnection(): RTCPeerConnection {
+    if (this.peerConnection) return this.peerConnection
+
+    const pc = new RTCPeerConnection({
+      iceServers: this.getIceServers(),
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require'
+    })
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        this.sendSignal('ice-candidate', {
+          candidate: event.candidate.toJSON()
+        })
+      }
+    }
+
+    pc.ondatachannel = (event) => {
+      this.setupDataChannel(event.channel)
+    }
+
+    pc.ontrack = (event) => {
+      const track = event.track
+      const stream = event.streams[0] || new MediaStream([track])
+
+      if (track.kind === 'audio') {
+        // Distingue estritamente o Microfone do Amigo vs Áudio do Filme/Tela Compartilhada
+        const isScreenAudio =
+          (this.remoteStreamIds.screenStreamId &&
+            stream.id === this.remoteStreamIds.screenStreamId) ||
+          track.label.toLowerCase().includes('screen') ||
+          track.label.toLowerCase().includes('system') ||
+          track.label.toLowerCase().includes('loopback')
+
+        if (isScreenAudio) {
+          if (!this.remoteScreenStream) {
+            this.remoteScreenStream = new MediaStream()
+          }
+          this.remoteScreenStream.addTrack(track)
+        } else {
+          this.remoteVoiceStream = new MediaStream([track])
+          this.setupRemoteVoiceAnalyser(this.remoteVoiceStream)
+        }
+      } else if (track.kind === 'video') {
+        const isScreenVideo =
+          (this.remoteStreamIds.screenStreamId &&
+            stream.id === this.remoteStreamIds.screenStreamId) ||
+          track.label.toLowerCase().includes('screen') ||
+          track.label.toLowerCase().includes('window') ||
+          track.label.toLowerCase().includes('display')
+
+        if (isScreenVideo) {
+          if (!this.remoteScreenStream) {
+            this.remoteScreenStream = new MediaStream()
+          }
+          // Remove tracks de vídeo antigas se houver
+          this.remoteScreenStream.getVideoTracks().forEach((t) => this.remoteScreenStream?.removeTrack(t))
+          this.remoteScreenStream.addTrack(track)
+        } else {
+          this.remoteCamStream = new MediaStream([track])
+        }
+      }
+
+      this.emitStreamsUpdated()
+      this.emitCallState()
+    }
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+        this.emitCallState()
+      }
+    }
+
+    this.peerConnection = pc
+    return pc
+  }
+
+  public async connectDataChannelOnly(): Promise<void> {
+    const pc = this.ensurePeerConnection()
+    if (!this.dataChannel) {
+      const dc = pc.createDataChannel('msn-p2p-data', { ordered: true })
+      this.setupDataChannel(dc)
+    }
+
+    const offer = await pc.createOffer()
+    await this.setLocalDescriptionSafe(pc, offer)
+    await this.sendSignal('sdp-offer', {
+      sdp: pc.localDescription,
+      isMediaCall: false,
+      streamIds: this.getLocalStreamIds()
+    })
+  }
+
+  // ==========================================================================
+  // 4. SDP MUNGING SEGURO: CODEC H.264 HARDWARE (NVENC/AMF/QUICKSYNC) + 10MBPS + OPUS 510KBPS STEREO
+  // ==========================================================================
+  private mungeSdpForHardwareH264AndOpus(sdp: string): string {
+    const lines = sdp.split('\r\n')
+
+    // 1. Descobre todos os Payload Types (PT) do codec H264 para priorizar NVENC / QuickSync / AMF
+    const h264PayloadTypes: string[] = []
+    const rtxAptMap: Record<string, string> = {}
+
+    for (const line of lines) {
+      const h264Match = line.match(/^a=rtpmap:(\d+)\s+H264\/90000/i)
+      if (h264Match) {
+        h264PayloadTypes.push(h264Match[1])
+      }
+      const rtxMatch = line.match(/^a=fmtp:(\d+)\s+apt=(\d+)/i)
+      if (rtxMatch) {
+        rtxAptMap[rtxMatch[2]] = rtxMatch[1]
+      }
+    }
+
+    const prioritizedVideoPts: string[] = []
+    for (const pt of h264PayloadTypes) {
+      prioritizedVideoPts.push(pt)
+      if (rtxAptMap[pt]) {
+        prioritizedVideoPts.push(rtxAptMap[pt])
+      }
+    }
+
+    // 2. Descobre o Payload Type do Opus para aplicar 510 kbps Stereo CBR
+    let opusPt: string | null = null
+    for (const line of lines) {
+      const opusMatch = line.match(/^a=rtpmap:(\d+)\s+opus\/48000\/2/i)
+      if (opusMatch) {
+        opusPt = opusMatch[1]
+        break
+      }
+    }
+
+    const outputLines: string[] = []
+    let inVideoSection = false
+
+    for (let i = 0; i < lines.length; i++) {
+      let line = lines[i]
+
+      if (line.startsWith('m=video ')) {
+        inVideoSection = true
+        if (prioritizedVideoPts.length > 0) {
+          const parts = line.split(' ')
+          const header = parts.slice(0, 3)
+          const existingPts = parts.slice(3)
+          const remainingPts = existingPts.filter((pt) => !prioritizedVideoPts.includes(pt))
+          line = [...header, ...prioritizedVideoPts, ...remainingPts].join(' ')
+        }
+        outputLines.push(line)
+        continue
+      }
+
+      if (line.startsWith('m=audio ') || line.startsWith('m=application ')) {
+        inVideoSection = false
+      }
+
+      // Na seção de vídeo, adiciona b=AS:10000 logo APÓS a linha c=IN (respeitando RFC 4566)
+      if (inVideoSection && line.startsWith('c=IN ')) {
+        outputLines.push(line)
+        outputLines.push('b=AS:10000')
+        continue
+      }
+
+      // Configura Opus Stereo 510 kbps CBR para o áudio do filme/sistema
+      if (opusPt && line.startsWith(`a=fmtp:${opusPt} `)) {
+        line = `a=fmtp:${opusPt} minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=510000;cbr=1`
+      }
+
+      // Injeta parâmetros de bitrate alto nas linhas fmtp do H.264
+      if (inVideoSection && h264PayloadTypes.some((pt) => line.startsWith(`a=fmtp:${pt} `))) {
+        if (!line.includes('x-google-max-bitrate')) {
+          line = `${line};x-google-max-bitrate=10000;x-google-min-bitrate=2500;x-google-start-bitrate=6000`
+        }
+      }
+
+      outputLines.push(line)
+    }
+
+    return outputLines.join('\r\n')
+  }
+
+  private async setLocalDescriptionSafe(
+    pc: RTCPeerConnection,
+    desc: RTCSessionDescriptionInit
+  ): Promise<void> {
+    try {
+      const munged: RTCSessionDescriptionInit = {
+        type: desc.type,
+        sdp: this.mungeSdpForHardwareH264AndOpus(desc.sdp || '')
+      }
+      await pc.setLocalDescription(munged)
+    } catch (err) {
+      console.warn('[WebRTC] Fallback para SDP padrão sem munging:', err)
+      await pc.setLocalDescription(desc)
+    }
+  }
+
+  private async flushPendingIceCandidates(pc: RTCPeerConnection): Promise<void> {
+    if (!pc.remoteDescription || this.pendingIceCandidates.length === 0) return
+    const candidates = [...this.pendingIceCandidates]
+    this.pendingIceCandidates = []
+    for (const c of candidates) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(c))
+      } catch (err) {
+        console.warn('[WebRTC] Erro ao adicionar ICE candidate da fila:', err)
+      }
+    }
+  }
+
+  // ==========================================================================
+  // 5. CHAMADAS DE VOZ, VÍDEO (1x1) E COMPARTILHAMENTO DE TELA (ZERO ECO)
+  // ==========================================================================
+  private async acquireMicAndCam(withVideo: boolean): Promise<void> {
+    // 1. Track do Microfone em MediaStream exclusivo (com try/catch individual para nunca travar o Atender)
+    if (!this.localMicStream) {
+      try {
+        this.localMicStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          },
+          video: false
+        })
+        this.setupLocalVoiceAnalyser(this.localMicStream)
+      } catch (err) {
+        console.warn('[WebRTC] Microfone indisponível ou em uso, seguindo chamada:', err)
+      }
+    }
+
+    // 2. Track da Webcam em MediaStream separado (com try/catch individual caso não tenha webcam ou esteja em uso)
+    if (withVideo && !this.localCamStream) {
+      try {
+        const isCompact = this.ecoMode || Boolean(this.localScreenStream)
+        this.localCamStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: isCompact ? 320 : 640 },
+            height: { ideal: isCompact ? 320 : 640 },
+            frameRate: { ideal: isCompact ? 24 : 30 }
+          },
+          audio: false
+        })
+      } catch (err) {
+        console.warn('[WebRTC] Webcam indisponível ou em uso, seguindo chamada apenas com áudio/recepção:', err)
+      }
+    }
+  }
+
+  public async startCall(withVideo = true): Promise<void> {
+    await this.acquireMicAndCam(withVideo)
+    const pc = this.ensurePeerConnection()
+
+    if (!this.dataChannel) {
+      const dc = pc.createDataChannel('msn-p2p-data', { ordered: true })
+      this.setupDataChannel(dc)
+    }
+
+    this.attachLocalStreamsToPeer(pc)
+    this.inCall = true
+    this.emitStreamsUpdated()
+    this.emitCallState()
+
+    const offer = await pc.createOffer({
+      offerToReceiveAudio: true,
+      offerToReceiveVideo: true
+    })
+    await this.setLocalDescriptionSafe(pc, offer)
+
+    this.broadcastStreamMeta()
+    await this.sendSignal('sdp-offer', {
+      sdp: pc.localDescription,
+      isMediaCall: true,
+      streamIds: this.getLocalStreamIds()
+    })
+  }
+
+  public async acceptIncomingCall(): Promise<void> {
+    if (!this.pendingOffer) return
+    const offerToAccept = this.pendingOffer
+    this.pendingOffer = null
+    this.incomingCallFrom = null
+    this.inCall = true
+    this.emitCallState()
+
+    await this.acquireMicAndCam(true)
+    const pc = this.ensurePeerConnection()
+
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(offerToAccept))
+      await this.flushPendingIceCandidates(pc)
+      this.attachLocalStreamsToPeer(pc)
+
+      const answer = await pc.createAnswer()
+      await this.setLocalDescriptionSafe(pc, answer)
+
+      this.broadcastStreamMeta()
+      await this.sendSignal('sdp-answer', {
+        sdp: pc.localDescription,
+        streamIds: this.getLocalStreamIds()
+      })
+    } catch (err) {
+      console.error('[WebRTC] Erro ao aceitar chamada:', err)
+    }
+
+    this.emitStreamsUpdated()
+    this.emitCallState()
+  }
+
+  public rejectOrHangupCall(): void {
+    this.sendSignal('hangup', {})
+    this.cleanupMediaStreams()
+    this.pendingOffer = null
+    this.incomingCallFrom = null
+    this.inCall = false
+    this.emitStreamsUpdated()
+    this.emitCallState()
+  }
+
+  /**
+   * Inicia Compartilhamento de Tela / Janela Específica (Modo Cinema)
+   * - Vídeo 60fps com contentHint = 'motion' e até 10 Mbps
+   * - Áudio do Sistema em track separada com echoCancellation: false para fidelidade musical/filme
+   * - Reduz automaticamente as webcams de canto para 320x320 @ 24fps
+   */
+  public async startScreenShare(sourceId: string, includeSystemAudio: boolean): Promise<void> {
+    if (!this.inCall) {
+      await this.startCall(true)
+    }
+
+    const constraints: MediaStreamConstraints = {
+      audio: includeSystemAudio
+        ? ({
+            mandatory: {
+              chromeMediaSource: 'desktop',
+              chromeMediaSourceId: sourceId
+            }
+          } as unknown as MediaTrackConstraints)
+        : false,
+      video: {
+        mandatory: {
+          chromeMediaSource: 'desktop',
+          chromeMediaSourceId: sourceId,
+          maxWidth: 1920,
+          maxHeight: 1080,
+          minFrameRate: 30,
+          maxFrameRate: 60
+        }
+      } as unknown as MediaTrackConstraints
+    }
+
+    const rawDesktopStream = await navigator.mediaDevices.getUserMedia(constraints)
+
+    // Configura videoTrack.contentHint = 'motion' para fluidez de 60fps em filmes/jogos
+    const screenVideoTrack = rawDesktopStream.getVideoTracks()[0]
+    if (screenVideoTrack) {
+      screenVideoTrack.contentHint = 'motion'
+      screenVideoTrack.onended = () => {
+        this.stopScreenShare()
+      }
+    }
+
+    // Desativa processamentos de voz na track de áudio da tela (fidelidade total de som estéreo)
+    const screenAudioTrack = rawDesktopStream.getAudioTracks()[0]
+    if (screenAudioTrack) {
+      await screenAudioTrack
+        .applyConstraints({
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        })
+        .catch(() => {})
+    }
+
+    this.localScreenStream = rawDesktopStream
+
+    // Otimização Gamer: reduz a resolução das câmeras de canto para 320x320 @ 24fps
+    await this.applySmartCornerCameraConstraints(true)
+
+    const pc = this.ensurePeerConnection()
+    this.attachLocalStreamsToPeer(pc)
+
+    // Configura maxBitrate de 10 Mbps (10_000_000 bps) e 60 fps no RTCRtpSender da tela
+    for (const sender of pc.getSenders()) {
+      if (sender.track && screenVideoTrack && sender.track.id === screenVideoTrack.id) {
+        const params = sender.getParameters()
+        if (!params.encodings || params.encodings.length === 0) {
+          params.encodings = [{}]
+        }
+        params.encodings[0].maxBitrate = 10_000_000
+        params.encodings[0].maxFramerate = 60
+        await sender.setParameters(params).catch(() => {})
+      }
+    }
+
+    await this.renegotiatePeerConnection()
+    this.emitStreamsUpdated()
+    this.emitCallState()
+  }
+
+  public async stopScreenShare(): Promise<void> {
+    if (!this.localScreenStream) return
+
+    const pc = this.peerConnection
+    if (pc) {
+      const tracksToRemove = this.localScreenStream.getTracks()
+      for (const sender of pc.getSenders()) {
+        if (sender.track && tracksToRemove.some((t) => t.id === sender.track?.id)) {
+          pc.removeTrack(sender)
+        }
+      }
+    }
+
+    this.localScreenStream.getTracks().forEach((t) => t.stop())
+    this.localScreenStream = null
+
+    if (!this.ecoMode) {
+      await this.applySmartCornerCameraConstraints(false)
+    }
+
+    await this.renegotiatePeerConnection()
+    this.emitStreamsUpdated()
+    this.emitCallState()
+  }
+
+  /**
+   * Ajusta dinamicamente a resolução da webcam para 320x320 @ 24fps no Modo Jogo / Modo Cinema
+   */
+  public async setEcoMode(enabled: boolean): Promise<void> {
+    this.ecoMode = enabled
+    await this.applySmartCornerCameraConstraints(enabled || Boolean(this.localScreenStream))
+  }
+
+  private async applySmartCornerCameraConstraints(compactMode: boolean): Promise<void> {
+    const camTrack = this.localCamStream?.getVideoTracks()[0]
+    if (!camTrack) return
+
+    try {
+      await camTrack.applyConstraints({
+        width: { ideal: compactMode ? 320 : 640 },
+        height: { ideal: compactMode ? 320 : 640 },
+        frameRate: { ideal: compactMode ? 24 : 30 }
+      })
+    } catch (err) {
+      console.warn('[WebRTC] Falha ao aplicar constraints inteligentes na câmera:', err)
+    }
+  }
+
+  public toggleMicrophoneMute(): boolean {
+    const audioTrack = this.localMicStream?.getAudioTracks()[0]
+    if (!audioTrack) return false
+    audioTrack.enabled = !audioTrack.enabled
+    return !audioTrack.enabled // retorna true se ficou mutado
+  }
+
+  public isMicrophoneMuted(): boolean {
+    const audioTrack = this.localMicStream?.getAudioTracks()[0]
+    return audioTrack ? !audioTrack.enabled : false
+  }
+
+  public toggleCameraEnabled(): boolean {
+    const videoTrack = this.localCamStream?.getVideoTracks()[0]
+    if (!videoTrack) return false
+    videoTrack.enabled = !videoTrack.enabled
+    this.emitStreamsUpdated()
+    return videoTrack.enabled
+  }
+
+  private attachLocalStreamsToPeer(pc: RTCPeerConnection): void {
+    const existingSenders = pc.getSenders()
+
+    const addStreamTracks = (stream: MediaStream | null): void => {
+      if (!stream) return
+      for (const track of stream.getTracks()) {
+        const alreadyAdded = existingSenders.some((s) => s.track?.id === track.id)
+        if (!alreadyAdded) {
+          pc.addTrack(track, stream)
+        }
+      }
+    }
+
+    addStreamTracks(this.localMicStream)
+    addStreamTracks(this.localCamStream)
+    addStreamTracks(this.localScreenStream)
+  }
+
+  private async renegotiatePeerConnection(): Promise<void> {
+    if (!this.peerConnection) return
+    this.broadcastStreamMeta()
+    const offer = await this.peerConnection.createOffer()
+    await this.setLocalDescriptionSafe(this.peerConnection, offer)
+    await this.sendSignal('renegotiate-offer', {
+      sdp: this.peerConnection.localDescription,
+      streamIds: this.getLocalStreamIds()
+    })
+  }
+
+  private getLocalStreamIds(): {
+    micStreamId: string | null
+    camStreamId: string | null
+    screenStreamId: string | null
+  } {
+    return {
+      micStreamId: this.localMicStream?.id || null,
+      camStreamId: this.localCamStream?.id || null,
+      screenStreamId: this.localScreenStream?.id || null
+    }
+  }
+
+  private broadcastStreamMeta(): void {
+    const ids = this.getLocalStreamIds()
+    this.sendDataChannelPacket({
+      type: 'stream-meta',
+      sender: this.myUser,
+      ...ids
+    })
+  }
+
+  // ==========================================================================
+  // 6. HANDLER DE SINAIS WEBRTC RECEBIDOS
+  // ==========================================================================
+  private async handleIncomingSignal(
+    sender: MsnUser,
+    type: string,
+    data: Record<string, unknown>
+  ): Promise<void> {
+    if (data.streamIds) {
+      this.remoteStreamIds = data.streamIds as {
+        micStreamId: string | null
+        camStreamId: string | null
+        screenStreamId: string | null
+      }
+    }
+
+    if (type === 'sdp-offer') {
+      const sdp = data.sdp as RTCSessionDescriptionInit
+      const isMediaCall = Boolean(data.isMediaCall)
+
+      if (!isMediaCall && !this.inCall) {
+        // Conexão automática do DataChannel P2P para chat de latência zero
+        const pc = this.ensurePeerConnection()
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp))
+        await this.flushPendingIceCandidates(pc)
+        const answer = await pc.createAnswer()
+        await this.setLocalDescriptionSafe(pc, answer)
+        await this.sendSignal('sdp-answer', {
+          sdp: pc.localDescription,
+          streamIds: this.getLocalStreamIds()
+        })
+        return
+      }
+
+      // Se já estamos em chamada, aceita renegociação automaticamente
+      if (this.inCall) {
+        const pc = this.ensurePeerConnection()
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp))
+        await this.flushPendingIceCandidates(pc)
+        const answer = await pc.createAnswer()
+        await this.setLocalDescriptionSafe(pc, answer)
+        await this.sendSignal('sdp-answer', {
+          sdp: pc.localDescription,
+          streamIds: this.getLocalStreamIds()
+        })
+        return
+      }
+
+      // Nova ligação recebida do amigo
+      this.pendingOffer = sdp
+      this.incomingCallFrom = sender
+      this.emitCallState()
+      return
+    }
+
+    if (type === 'renegotiate-offer') {
+      const sdp = data.sdp as RTCSessionDescriptionInit
+      const pc = this.ensurePeerConnection()
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp))
+      await this.flushPendingIceCandidates(pc)
+      const answer = await pc.createAnswer()
+      await this.setLocalDescriptionSafe(pc, answer)
+      await this.sendSignal('sdp-answer', {
+        sdp: pc.localDescription,
+        streamIds: this.getLocalStreamIds()
+      })
+      return
+    }
+
+    if (type === 'sdp-answer') {
+      const sdp = data.sdp as RTCSessionDescriptionInit
+      if (this.peerConnection && this.peerConnection.signalingState !== 'stable') {
+        await this.peerConnection.setRemoteDescription(new RTCSessionDescription(sdp))
+        await this.flushPendingIceCandidates(this.peerConnection)
+      }
+      return
+    }
+
+    if (type === 'ice-candidate') {
+      const candidate = data.candidate as RTCIceCandidateInit
+      if (!candidate) return
+      if (this.peerConnection && this.peerConnection.remoteDescription) {
+        await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {})
+      } else {
+        this.pendingIceCandidates.push(candidate)
+      }
+      return
+    }
+
+    if (type === 'hangup') {
+      this.cleanupMediaStreams()
+      this.pendingOffer = null
+      this.incomingCallFrom = null
+      this.inCall = false
+      this.emitStreamsUpdated()
+      this.emitCallState()
+    }
+  }
+
+  // ==========================================================================
+  // 7. WEB AUDIO API: BOOST DE VOZ ATÉ 200% + AUTO-DUCKING DO DJ BOT (70%)
+  // ==========================================================================
+  private ensureAudioContext(): AudioContext {
+    if (!this.audioCtx) {
+      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+      this.audioCtx = new AudioCtx()
+    }
+    if (this.audioCtx.state === 'suspended') {
+      this.audioCtx.resume().catch(() => {})
+    }
+    return this.audioCtx
+  }
+
+  private setupLocalVoiceAnalyser(stream: MediaStream): void {
+    try {
+      const ctx = this.ensureAudioContext()
+      const source = ctx.createMediaStreamSource(stream)
+      const analyser = ctx.createAnalyser()
+      analyser.fftSize = 256
+      source.connect(analyser)
+      this.localAnalyser = analyser
+      this.startVoiceActivityLoop()
+    } catch (err) {
+      console.warn('[WebRTC] Falha ao iniciar analyser de voz local:', err)
+    }
+  }
+
+  private setupRemoteVoiceAnalyser(stream: MediaStream): void {
+    try {
+      const ctx = this.ensureAudioContext()
+      const source = ctx.createMediaStreamSource(stream)
+      const analyser = ctx.createAnalyser()
+      analyser.fftSize = 256
+      const gainNode = ctx.createGain()
+      gainNode.gain.value = 1.0 // 100% padrão (suporta até 2.0 = 200% boost)
+
+      source.connect(analyser)
+      source.connect(gainNode)
+      gainNode.connect(ctx.destination)
+
+      this.remoteAnalyser = analyser
+      this.remoteVoiceGainNode = gainNode
+      this.startVoiceActivityLoop()
+    } catch (err) {
+      console.warn('[WebRTC] Falha ao iniciar boost/analyser de voz remota:', err)
+    }
+  }
+
+  /**
+   * Ajusta o volume da voz do amigo de 0% a 200% (0.0 a 2.0) usando GainNode da Web Audio API
+   */
+  public setRemoteVoiceBoostVolume(volumePercent: number): void {
+    if (this.remoteVoiceGainNode && this.audioCtx) {
+      const normalized = Math.max(0, Math.min(200, volumePercent)) / 100
+      this.remoteVoiceGainNode.gain.setTargetAtTime(normalized, this.audioCtx.currentTime, 0.03)
+    }
+  }
+
+  /**
+   * Loop leve de detecção de atividade de voz (Auto-Ducking: reduz DJ Bot em 70% quando alguém fala,
+   * retornando ao volume normal 800ms após o silêncio)
+   */
+  private startVoiceActivityLoop(): void {
+    if (this.vadInterval) return
+    const buffer = new Uint8Array(64)
+
+    const computeRms = (analyser: AnalyserNode | null): number => {
+      if (!analyser) return 0
+      analyser.getByteFrequencyData(buffer)
+      let sum = 0
+      for (let i = 0; i < buffer.length; i++) {
+        sum += buffer[i]
+      }
+      return sum / buffer.length
+    }
+
+    this.vadInterval = setInterval(() => {
+      const localMicEnabled = !this.isMicrophoneMuted()
+      const localLevel = localMicEnabled ? computeRms(this.localAnalyser) : 0
+      const remoteLevel = computeRms(this.remoteAnalyser)
+
+      const speakingNow = localLevel > 24 || remoteLevel > 24
+
+      if (speakingNow) {
+        if (this.silenceTimeout) {
+          clearTimeout(this.silenceTimeout)
+          this.silenceTimeout = null
+        }
+        if (!this.currentlySpeaking) {
+          this.currentlySpeaking = true
+          this.callbacks.onVoiceActivityChange(true)
+        }
+      } else if (this.currentlySpeaking && !this.silenceTimeout) {
+        // Restaura suavemente 800ms após o silêncio
+        this.silenceTimeout = setTimeout(() => {
+          this.currentlySpeaking = false
+          this.silenceTimeout = null
+          this.callbacks.onVoiceActivityChange(false)
+        }, 800)
+      }
+    }, 120)
+  }
+
+  // ==========================================================================
+  // 8. RTCDataChannel P2P (CHAT, PRINTS, ARQUIVOS ILIMITADOS, NUDGE, LASER, DJ BOT, RANKINGS)
+  // ==========================================================================
+  private setupDataChannel(channel: RTCDataChannel): void {
+    this.dataChannel = channel
+    channel.binaryType = 'arraybuffer'
+
+    channel.onopen = () => {
+      this.broadcastStreamMeta()
+      this.sendSubnickAndStatus(this.mySubnick, this.myStatus)
+    }
+
+    channel.onmessage = (event) => {
+      try {
+        const packet = JSON.parse(event.data as string) as DataChannelPacket
+        this.handleDataChannelPacket(packet)
+      } catch (err) {
+        console.warn('[DataChannel] Erro ao processar pacote P2P:', err)
+      }
+    }
+  }
+
+  public sendDataChannelPacket(packet: DataChannelPacket): boolean {
+    if (this.dataChannel && this.dataChannel.readyState === 'open') {
+      this.dataChannel.send(JSON.stringify(packet))
+      return true
+    }
+    return false
+  }
+
+  private handleDataChannelPacket(packet: DataChannelPacket): void {
+    switch (packet.type) {
+      case 'chat-message':
+        this.callbacks.onChatMessage({
+          id: packet.id,
+          sender: packet.sender,
+          text: packet.text,
+          imageDataUrl: packet.imageDataUrl,
+          timestamp: packet.timestamp
+        })
+        break
+
+      case 'nudge':
+        this.callbacks.onNudgeReceived(packet.sender)
+        break
+
+      case 'laser-pointer':
+        this.callbacks.onLaserPointer({
+          id: `${Date.now()}-${Math.random()}`,
+          x: packet.x,
+          y: packet.y,
+          sender: packet.sender,
+          createdAt: Date.now()
+        })
+        break
+
+      case 'soundboard-wink':
+        this.callbacks.onSoundboardWink(packet.sender, packet.winkId, packet.label)
+        break
+
+      case 'subnick-update':
+        this.friendLastStatus = packet.status
+        this.callbacks.onFriendPresenceChange(packet.status, packet.subnick, false)
+        break
+
+      case 'dj-sync':
+        this.callbacks.onDjSync(packet.state)
+        break
+
+      case 'album-ranked':
+        this.callbacks.onAlbumRankedNotification({
+          user: packet.user,
+          albumId: packet.albumId,
+          albumName: packet.albumName,
+          artistName: packet.artistName,
+          rating: packet.rating
+        })
+        break
+
+      case 'stream-meta':
+        this.remoteStreamIds = {
+          micStreamId: packet.micStreamId,
+          camStreamId: packet.camStreamId,
+          screenStreamId: packet.screenStreamId
+        }
+        break
+
+      case 'file-start':
+        this.incomingFiles.set(packet.transferId, {
+          sender: packet.sender,
+          fileName: packet.fileName,
+          fileSize: packet.fileSize,
+          mimeType: packet.mimeType,
+          totalChunks: packet.totalChunks,
+          chunks: new Array(packet.totalChunks),
+          receivedCount: 0
+        })
+        this.callbacks.onFileProgress({
+          fileName: packet.fileName,
+          percent: 0,
+          direction: 'receiving'
+        })
+        break
+
+      case 'file-chunk': {
+        const transfer = this.incomingFiles.get(packet.transferId)
+        if (!transfer) break
+        transfer.chunks[packet.chunkIndex] = packet.dataBase64
+        transfer.receivedCount += 1
+        const percent = Math.round((transfer.receivedCount / transfer.totalChunks) * 100)
+        this.callbacks.onFileProgress({
+          fileName: transfer.fileName,
+          percent,
+          direction: 'receiving'
+        })
+        break
+      }
+
+      case 'file-end': {
+        const transfer = this.incomingFiles.get(packet.transferId)
+        if (!transfer) break
+        this.incomingFiles.delete(packet.transferId)
+        this.callbacks.onFileProgress(null)
+
+        const fullBase64 = transfer.chunks.join('')
+        const byteCharacters = atob(fullBase64)
+        const byteNumbers = new Array(byteCharacters.length)
+        for (let i = 0; i < byteCharacters.length; i++) {
+          byteNumbers[i] = byteCharacters.charCodeAt(i)
+        }
+        const byteArray = new Uint8Array(byteNumbers)
+        const blob = new Blob([byteArray], {
+          type: transfer.mimeType || 'application/octet-stream'
+        })
+        const blobUrl = URL.createObjectURL(blob)
+
+        this.callbacks.onChatMessage({
+          id: `file-${packet.transferId}`,
+          sender: transfer.sender,
+          text: `📁 Enviou um arquivo P2P: ${transfer.fileName}`,
+          fileAttachment: {
+            fileName: transfer.fileName,
+            fileSize: transfer.fileSize,
+            mimeType: transfer.mimeType,
+            blobUrl
+          },
+          timestamp: new Date().toLocaleTimeString('pt-BR', {
+            hour: '2-digit',
+            minute: '2-digit'
+          })
+        })
+        break
+      }
+    }
+  }
+
+  // Métodos públicos de envio P2P
+  public sendChatMessage(text?: string, imageDataUrl?: string): ChatMessageItem {
+    const msg: ChatMessageItem = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      sender: this.myUser,
+      text,
+      imageDataUrl,
+      timestamp: new Date().toLocaleTimeString('pt-BR', {
+        hour: '2-digit',
+        minute: '2-digit'
+      })
+    }
+
+    this.sendDataChannelPacket({
+      type: 'chat-message',
+      id: msg.id,
+      sender: msg.sender,
+      text: msg.text,
+      imageDataUrl: msg.imageDataUrl,
+      timestamp: msg.timestamp
+    })
+
+    return msg
+  }
+
+  /**
+   * Envia arquivos P2P de qualquer tamanho dividindo em chunks seguros de 48 KB com controle de backpressure
+   */
+  public async sendFileP2P(file: File): Promise<ChatMessageItem> {
+    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+      await this.connectDataChannelOnly()
+    }
+
+    const arrayBuffer = await file.arrayBuffer()
+    const bytes = new Uint8Array(arrayBuffer)
+    let binary = ''
+    for (let i = 0; i < bytes.byteLength; i++) {
+      binary += String.fromCharCode(bytes[i])
+    }
+    const base64All = btoa(binary)
+
+    const chunkSize = 48 * 1024 // 48 KB por pacote
+    const totalChunks = Math.max(1, Math.ceil(base64All.length / chunkSize))
+    const transferId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+
+    this.sendDataChannelPacket({
+      type: 'file-start',
+      transferId,
+      sender: this.myUser,
+      fileName: file.name,
+      fileSize: file.size,
+      mimeType: file.type || 'application/octet-stream',
+      totalChunks
+    })
+
+    for (let idx = 0; idx < totalChunks; idx++) {
+      const slice = base64All.slice(idx * chunkSize, (idx + 1) * chunkSize)
+      this.sendDataChannelPacket({
+        type: 'file-chunk',
+        transferId,
+        chunkIndex: idx,
+        dataBase64: slice
+      })
+
+      const percent = Math.round(((idx + 1) / totalChunks) * 100)
+      this.callbacks.onFileProgress({
+        fileName: file.name,
+        percent,
+        direction: 'sending'
+      })
+
+      if (idx % 6 === 0) {
+        await new Promise((r) => setTimeout(r, 8))
+      }
+    }
+
+    this.sendDataChannelPacket({
+      type: 'file-end',
+      transferId
+    })
+    this.callbacks.onFileProgress(null)
+
+    const localBlobUrl = URL.createObjectURL(file)
+    return {
+      id: `file-${transferId}`,
+      sender: this.myUser,
+      text: `📁 Arquivo enviado: ${file.name}`,
+      fileAttachment: {
+        fileName: file.name,
+        fileSize: file.size,
+        mimeType: file.type || 'application/octet-stream',
+        blobUrl: localBlobUrl
+      },
+      timestamp: new Date().toLocaleTimeString('pt-BR', {
+        hour: '2-digit',
+        minute: '2-digit'
+      })
+    }
+  }
+
+  public sendNudge(): void {
+    this.sendDataChannelPacket({
+      type: 'nudge',
+      sender: this.myUser,
+      timestamp: new Date().toISOString()
+    })
+  }
+
+  public sendLaserPointer(x: number, y: number): void {
+    this.sendDataChannelPacket({
+      type: 'laser-pointer',
+      sender: this.myUser,
+      x,
+      y
+    })
+  }
+
+  public sendSoundboardWink(winkId: SoundboardWinkId, label: string): void {
+    this.sendDataChannelPacket({
+      type: 'soundboard-wink',
+      sender: this.myUser,
+      winkId,
+      label
+    })
+  }
+
+  public sendSubnickAndStatus(subnick: string, status: PresenceStatus): void {
+    this.mySubnick = subnick
+    this.myStatus = status
+
+    this.sendDataChannelPacket({
+      type: 'subnick-update',
+      sender: this.myUser,
+      subnick,
+      status
+    })
+
+    if (this.realtimeChannel) {
+      this.realtimeChannel
+        .track({
+          user: this.myUser,
+          status: this.myStatus,
+          subnick: this.mySubnick,
+          online_at: new Date().toISOString()
+        })
+        .catch(() => {})
+    }
+  }
+
+  public sendDjSync(state: DjSyncState): void {
+    this.sendDataChannelPacket({
+      type: 'dj-sync',
+      state
+    })
+  }
+
+  public sendAlbumRankedAlert(payload: {
+    user: MsnUser
+    albumId: string
+    albumName: string
+    artistName: string
+    rating: number
+  }): void {
+    this.sendDataChannelPacket({
+      type: 'album-ranked',
+      ...payload
+    })
+  }
+
+  // ==========================================================================
+  // 9. LIMPEZA DE RECURSOS E EMISSÃO DE ESTADO
+  // ==========================================================================
+  private cleanupMediaStreams(): void {
+    if (this.peerConnection) {
+      for (const sender of this.peerConnection.getSenders()) {
+        if (sender.track) {
+          try {
+            this.peerConnection.removeTrack(sender)
+          } catch {
+            // ignora se pc estiver fechado
+          }
+        }
+      }
+    }
+    this.localMicStream?.getTracks().forEach((t) => t.stop())
+    this.localCamStream?.getTracks().forEach((t) => t.stop())
+    this.localScreenStream?.getTracks().forEach((t) => t.stop())
+
+    this.localMicStream = null
+    this.localCamStream = null
+    this.localScreenStream = null
+    this.remoteVoiceStream = null
+    this.remoteCamStream = null
+    this.remoteScreenStream = null
+  }
+
+  private emitStreamsUpdated(): void {
+    this.callbacks.onStreamsUpdated({
+      localCam: this.localCamStream,
+      localScreen: this.localScreenStream,
+      remoteVoice: this.remoteVoiceStream,
+      remoteCam: this.remoteCamStream,
+      remoteScreen: this.remoteScreenStream
+    })
+  }
+
+  private emitCallState(): void {
+    this.callbacks.onCallStateChange({
+      inCall: this.inCall,
+      incomingCallFrom: this.incomingCallFrom,
+      isScreenSharing: Boolean(this.localScreenStream),
+      remoteScreenSharing: Boolean(
+        this.remoteScreenStream && this.remoteScreenStream.getVideoTracks().length > 0
+      )
+    })
+  }
+
+  public destroy(): void {
+    if (this.vadInterval) clearInterval(this.vadInterval)
+    if (this.silenceTimeout) clearTimeout(this.silenceTimeout)
+    this.cleanupMediaStreams()
+    this.dataChannel?.close()
+    this.peerConnection?.close()
+    this.realtimeChannel?.unsubscribe()
+  }
+}
