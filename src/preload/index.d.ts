@@ -18,6 +18,9 @@ export interface MsnBridgeApi {
     ecoMode?: boolean
   }) => Promise<boolean>
   openAlbumRanker: () => Promise<boolean>
+  toggleFullscreen: () => Promise<boolean>
+  setFullscreen: (fullscreen: boolean) => Promise<boolean>
+  onFullscreenChanged: (callback: (isFullscreen: boolean) => void) => () => void
   nudgeWindow: () => Promise<boolean>
   showNativeNotification: (title: string, body: string) => Promise<boolean>
   getDesktopSources: () => Promise<DesktopSourceItem[]>

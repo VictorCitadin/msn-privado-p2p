@@ -24,7 +24,7 @@ import ytSearch from 'yt-search'
 // ============================================================================
 app.commandLine.appendSwitch(
   'enable-features',
-  'WebRtcAllowInputVolumeAdjustment,PulseaudioLoopbackForScreenShare'
+  'WebRtcAllowInputVolumeAdjustment,PulseaudioLoopbackForScreenShare,ChromeWideEchoCancellation'
 )
 app.commandLine.appendSwitch('js-flags', '--max-old-space-size=256')
 app.commandLine.appendSwitch('enable-accelerated-video-decode')
@@ -443,6 +443,15 @@ async function createMainWindow(): Promise<void> {
   mainWindow.on('show', () => notifyVisibility(true))
   mainWindow.on('focus', () => notifyVisibility(true))
 
+  const notifyFullscreen = (isFull: boolean): void => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('window-fullscreen-changed', isFull)
+    }
+  }
+
+  mainWindow.on('enter-full-screen', () => notifyFullscreen(true))
+  mainWindow.on('leave-full-screen', () => notifyFullscreen(false))
+
   // Fechar para a bandeja (System Tray) ao clicar no "X"
   mainWindow.on('close', (event) => {
     if (!isQuitting) {
@@ -851,6 +860,22 @@ function registerIpcHandlers(): void {
   ipcMain.handle('open-album-ranker', () => {
     openAlbumRankerWindow()
     return true
+  })
+
+  // Alternar Tela Cheia (Fullscreen) na Janela Principal durante Ligações
+  ipcMain.handle('window:toggle-fullscreen', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return false
+    const nextState = !mainWindow.isFullScreen()
+    mainWindow.setFullScreen(nextState)
+    mainWindow.webContents.send('window-fullscreen-changed', nextState)
+    return nextState
+  })
+
+  ipcMain.handle('window:set-fullscreen', (_event, fullscreen: boolean) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return false
+    mainWindow.setFullScreen(Boolean(fullscreen))
+    mainWindow.webContents.send('window-fullscreen-changed', Boolean(fullscreen))
+    return Boolean(fullscreen)
   })
 
   // Tremer a janela física do Electron por 600ms ("Chamar Atenção / Nudge")

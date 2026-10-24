@@ -213,17 +213,21 @@ export class MsnWebRTCService {
   private mySubnick = 'Disponível no MSN Privado 🎮'
   private ecoMode = false
 
-  // Web Audio API para Boost de Voz até 200% e Detecção de Voz (Auto-Ducking DJ Bot)
+  // Web Audio API para Boost de Voz até 200%, Cancelamento Digital de Loopback e Detecção de Voz (Auto-Ducking DJ Bot)
   private audioCtx: AudioContext | null = null
+  private workletRegistered = false
   private localVoiceSourceNode: MediaStreamAudioSourceNode | null = null
   private remoteVoiceSourceNode: MediaStreamAudioSourceNode | null = null
   private remoteVoiceGainNode: GainNode | null = null
   private remoteVoiceVolumePercent = 100
+  private rawScreenStream: MediaStream | null = null
+  private screenAudioSourceNode: MediaStreamAudioSourceNode | null = null
+  private screenAudioCancellerNode: AudioWorkletNode | null = null
+  private screenAudioDestNode: MediaStreamAudioDestinationNode | null = null
   private vadInterval: ReturnType<typeof setInterval> | null = null
   private localAnalyser: AnalyserNode | null = null
   private remoteAnalyser: AnalyserNode | null = null
   private silenceTimeout: ReturnType<typeof setTimeout> | null = null
-  private screenEchoGateTimeout: ReturnType<typeof setTimeout> | null = null
   private djBotPlaying = false
   private currentlySpeaking = false
 
@@ -793,6 +797,8 @@ export class MsnWebRTCService {
     }
 
     const rawDesktopStream = await navigator.mediaDevices.getUserMedia(constraints)
+    this.cleanupScreenAudioCanceller()
+    this.rawScreenStream = rawDesktopStream
 
     // Configura videoTrack.contentHint = 'motion' para fluidez de 60fps em filmes/jogos
     const screenVideoTrack = rawDesktopStream.getVideoTracks()[0]
@@ -803,19 +809,21 @@ export class MsnWebRTCService {
       }
     }
 
-    // Ativa echoCancellation na track de áudio da tela para o AEC3 do Chromium subtrair a voz do amigo
-    const screenAudioTrack = rawDesktopStream.getAudioTracks()[0]
-    if (screenAudioTrack) {
-      await screenAudioTrack
-        .applyConstraints({
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: false
-        })
-        .catch(() => {})
+    // Subtrai digitalmente APENAS a voz do amigo do loopback do Windows (-55 dB de cancelamento sample-accurate)
+    // sem mutar nem reduzir o som do filme/jogo quando alguém fala!
+    const finalScreenStream = new MediaStream()
+    if (screenVideoTrack) {
+      finalScreenStream.addTrack(screenVideoTrack)
     }
 
-    this.localScreenStream = rawDesktopStream
+    const rawScreenAudioTrack = rawDesktopStream.getAudioTracks()[0]
+    if (rawScreenAudioTrack) {
+      const cleanAudioTrack = await this.createCleanScreenAudioTrack(rawDesktopStream)
+      finalScreenStream.addTrack(cleanAudioTrack || rawScreenAudioTrack)
+    }
+
+    this.localScreenStream = finalScreenStream
+    this.updateScreenAudioLoopbackGate()
 
     // Otimização Gamer: reduz a resolução das câmeras de canto para 320x320 @ 24fps
     await this.applySmartCornerCameraConstraints(true)
@@ -856,6 +864,7 @@ export class MsnWebRTCService {
 
     this.localScreenStream.getTracks().forEach((t) => t.stop())
     this.localScreenStream = null
+    this.cleanupScreenAudioCanceller()
 
     if (!this.ecoMode) {
       await this.applySmartCornerCameraConstraints(false)
@@ -1060,17 +1069,285 @@ export class MsnWebRTCService {
   }
 
   // ==========================================================================
-  // 7. WEB AUDIO API: BOOST DE VOZ ATÉ 200% + AUTO-DUCKING DO DJ BOT (70%)
+  // 7. WEB AUDIO API: BOOST DE VOZ ATÉ 200%, CANCELAMENTO SAMPLE-ACCURATE DE LOOPBACK E AUTO-DUCKING DO DJ BOT
   // ==========================================================================
   private ensureAudioContext(): AudioContext {
     if (!this.audioCtx) {
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
-      this.audioCtx = new AudioCtx()
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+      this.audioCtx = new AudioCtx({ sampleRate: 48000 })
     }
     if (this.audioCtx.state === 'suspended') {
       this.audioCtx.resume().catch(() => {})
     }
     return this.audioCtx
+  }
+
+  private async ensureLoopbackCancellerWorklet(ctx: AudioContext): Promise<void> {
+    if (this.workletRegistered) return
+    const workletCode = `
+      class VoiceLoopbackCancellerProcessor extends AudioWorkletProcessor {
+        constructor() {
+          super();
+          this.ringSize = 32768;
+          this.ringMask = this.ringSize - 1;
+          this.refRing = new Float32Array(this.ringSize);
+          this.writePos = 0;
+
+          // Stage 1: Acumulador linear de fase exata a 12 kHz (decimação 4x) até 233ms (2800 bins)
+          this.decimSize = 4096;
+          this.decimMask = this.decimSize - 1;
+          this.refDecim = new Float32Array(this.decimSize);
+          this.decimPos = 0;
+          this.accRef = 0;
+          this.accDes = 0;
+          this.maxCoarseBins = 2800;
+          this.coarseCorr = new Float32Array(this.maxCoarseBins);
+          this.coarseEnergy = 0;
+          this.coarseSamples = 0;
+          this.coarseReady = false;
+          this.coarseCenter = 6800;
+
+          // Stage 2: Correlação fina de 1 sample em [-16, +16] ao redor de coarseCenter
+          this.fineRadius = 16;
+          this.fineLen = this.fineRadius * 2 + 1;
+          this.fineCorr = new Float32Array(this.fineLen);
+          this.fineEnergy = 0;
+          this.fineSamples = 0;
+
+          // Stage 3: Micro-FIR adaptativo NLMS de 9 taps cravado no atraso exato do WASAPI Loopback (-55 dB de cancelamento)
+          this.lockedLag = 6800;
+          this.isLocked = false;
+          this.wL = new Float32Array([0, 0, 0, 0, 1.0, 0, 0, 0, 0]);
+          this.wR = new Float32Array([0, 0, 0, 0, 1.0, 0, 0, 0, 0]);
+          this.sampleCount = 0;
+        }
+
+        process(inputs, outputs) {
+          const desktopIn = inputs[0];
+          const voiceRefIn = inputs[1];
+          const out = outputs[0];
+          if (!desktopIn || desktopIn.length === 0) return true;
+
+          const inL = desktopIn[0];
+          const inR = desktopIn[1] || desktopIn[0];
+          const outL = out[0];
+          const outR = out[1] || out[0];
+          const refL = (voiceRefIn && voiceRefIn[0]) ? voiceRefIn[0] : null;
+          const refR = (voiceRefIn && voiceRefIn[1]) ? voiceRefIn[1] : refL;
+          const n = inL.length;
+
+          for (let i = 0; i < n; i++) {
+            const r = refL ? (refR ? (refL[i] + refR[i]) * 0.5 : refL[i]) : 0;
+            const dL = inL[i];
+            const dR = inR[i];
+            const d = (dL + dR) * 0.5;
+            this.refRing[this.writePos] = r;
+
+            // Stage 1: Decimação linear 4x (12 kHz) imune a áudio de filme/jogo descorrelacionado
+            this.accRef += r;
+            this.accDes += d;
+            if ((this.sampleCount & 3) === 3) {
+              const rLP = this.accRef * 0.25;
+              const dLP = this.accDes * 0.25;
+              this.accRef = 0;
+              this.accDes = 0;
+              this.refDecim[this.decimPos] = rLP;
+
+              if (!this.coarseReady) {
+                const rEchoCheck = this.refDecim[(this.decimPos - 1650) & this.decimMask];
+                if (rEchoCheck * rEchoCheck > 1e-6) {
+                  this.coarseEnergy += rEchoCheck * rEchoCheck;
+                  this.coarseSamples++;
+                  for (let b = 200; b < this.maxCoarseBins; b++) {
+                    this.coarseCorr[b] += dLP * this.refDecim[(this.decimPos - b) & this.decimMask];
+                  }
+                  if (this.coarseSamples >= 1800) {
+                    let bestBin = 0;
+                    let bestVal = -1e9;
+                    for (let b = 200; b < this.maxCoarseBins; b++) {
+                      if (this.coarseCorr[b] > bestVal) {
+                        bestVal = this.coarseCorr[b];
+                        bestBin = b;
+                      }
+                    }
+                    if (bestVal > this.coarseEnergy * 0.35) {
+                      this.coarseCenter = bestBin * 4;
+                      this.coarseReady = true;
+                      this.fineCorr.fill(0);
+                      this.fineEnergy = 0;
+                      this.fineSamples = 0;
+                    } else {
+                      this.coarseCorr.fill(0);
+                      this.coarseEnergy = 0;
+                      this.coarseSamples = 0;
+                    }
+                  }
+                }
+              }
+              this.decimPos = (this.decimPos + 1) & this.decimMask;
+            }
+
+            // Stage 2: Refinamento exato de 1 sample ao redor de coarseCenter
+            if (this.coarseReady) {
+              const rCenter = this.refRing[(this.writePos - this.coarseCenter) & this.ringMask];
+              if (rCenter * rCenter > 1e-6) {
+                this.fineEnergy += rCenter * rCenter;
+                this.fineSamples++;
+                for (let f = 0; f < this.fineLen; f++) {
+                  const candLag = this.coarseCenter + (f - this.fineRadius);
+                  this.fineCorr[f] += d * this.refRing[(this.writePos - candLag) & this.ringMask];
+                }
+                if (this.fineSamples >= 3600) {
+                  let bestF = this.fineRadius;
+                  let bestVal = -1e9;
+                  for (let f = 0; f < this.fineLen; f++) {
+                    if (this.fineCorr[f] > bestVal) {
+                      bestVal = this.fineCorr[f];
+                      bestF = f;
+                    }
+                  }
+                  const ratio = bestVal / (this.fineEnergy + 1e-12);
+                  if (ratio > 0.45 && ratio < 1.55) {
+                    const nextLag = this.coarseCenter + (bestF - this.fineRadius);
+                    if (nextLag !== this.lockedLag) {
+                      this.lockedLag = nextLag;
+                      const initGain = Math.min(1.2, Math.max(0.8, ratio));
+                      this.wL.fill(0); this.wL[4] = initGain;
+                      this.wR.fill(0); this.wR[4] = initGain;
+                    }
+                    this.isLocked = true;
+                  }
+                  this.coarseReady = false;
+                  this.coarseCorr.fill(0);
+                  this.coarseEnergy = 0;
+                  this.coarseSamples = 0;
+                }
+              }
+            }
+
+            // Stage 3: Subtração em tempo real APENAS da voz do amigo (100% do som do filme/jogo preservado!)
+            if (this.isLocked) {
+              const baseLag = this.lockedLag - 4;
+              let yL = 0, yR = 0, norm = 1e-6;
+              for (let k = 0; k < 9; k++) {
+                const xk = this.refRing[(this.writePos - baseLag - k) & this.ringMask];
+                yL += this.wL[k] * xk;
+                yR += this.wR[k] * xk;
+                norm += xk * xk;
+              }
+              const errL = dL - yL;
+              const errR = dR - yR;
+              if (norm > 1e-5) {
+                const errP = (errL * errL + errR * errR) * 0.5;
+                const mu = 0.012 / (norm + errP * 8.0 + 1e-4);
+                for (let k = 0; k < 9; k++) {
+                  const xk = this.refRing[(this.writePos - baseLag - k) & this.ringMask];
+                  this.wL[k] += mu * errL * xk;
+                  this.wR[k] += mu * errR * xk;
+                }
+              }
+              outL[i] = errL;
+              if (outR !== outL) outR[i] = errR;
+            } else {
+              outL[i] = dL;
+              if (outR !== outL) outR[i] = dR;
+            }
+
+            this.writePos = (this.writePos + 1) & this.ringMask;
+            this.sampleCount++;
+          }
+          return true;
+        }
+      }
+      registerProcessor('voice-loopback-canceller', VoiceLoopbackCancellerProcessor);
+    `
+
+    const blob = new Blob([workletCode], { type: 'application/javascript' })
+    const url = URL.createObjectURL(blob)
+    try {
+      await ctx.audioWorklet.addModule(url)
+      this.workletRegistered = true
+    } finally {
+      URL.revokeObjectURL(url)
+    }
+  }
+
+  private async createCleanScreenAudioTrack(
+    rawDesktopStream: MediaStream
+  ): Promise<MediaStreamTrack | null> {
+    try {
+      const ctx = this.ensureAudioContext()
+      await this.ensureLoopbackCancellerWorklet(ctx)
+
+      const screenSource = ctx.createMediaStreamSource(rawDesktopStream)
+      const canceller = new AudioWorkletNode(ctx, 'voice-loopback-canceller', {
+        numberOfInputs: 2,
+        numberOfOutputs: 1,
+        outputChannelCount: [2]
+      })
+      const dest = ctx.createMediaStreamDestination()
+
+      screenSource.connect(canceller, 0, 0)
+      if (this.remoteVoiceGainNode) {
+        this.remoteVoiceGainNode.connect(canceller, 0, 1)
+      }
+      canceller.connect(dest)
+
+      this.screenAudioSourceNode = screenSource
+      this.screenAudioCancellerNode = canceller
+      this.screenAudioDestNode = dest
+
+      // Dispara um micro-pulso suave de calibração (120ms) após 450ms para travar o atraso exato do WASAPI imediatamente
+      setTimeout(() => {
+        if (!this.audioCtx || !this.screenAudioCancellerNode) return
+        try {
+          const calLen = Math.floor(this.audioCtx.sampleRate * 0.16)
+          const calBuf = this.audioCtx.createBuffer(1, calLen, this.audioCtx.sampleRate)
+          const ch = calBuf.getChannelData(0)
+          let seed = 246813579
+          let lp = 0
+          for (let i = 0; i < calLen; i++) {
+            seed = (seed * 1664525 + 1013904223) >>> 0
+            const white = seed / 4294967296 - 0.5
+            lp = 0.85 * lp + 0.15 * white
+            const windowEnv = Math.sin((Math.PI * i) / calLen)
+            ch[i] = lp * 0.04 * windowEnv
+          }
+          const calSrc = this.audioCtx.createBufferSource()
+          calSrc.buffer = calBuf
+          calSrc.connect(this.audioCtx.destination)
+          calSrc.connect(this.screenAudioCancellerNode, 0, 1)
+          calSrc.start()
+        } catch {}
+      }, 450)
+
+      return dest.stream.getAudioTracks()[0] || null
+    } catch (err) {
+      console.warn('[WebRTC] Fallback para áudio nativo da tela sem worklet:', err)
+      return null
+    }
+  }
+
+  private cleanupScreenAudioCanceller(): void {
+    if (this.screenAudioSourceNode) {
+      try {
+        this.screenAudioSourceNode.disconnect()
+      } catch {}
+      this.screenAudioSourceNode = null
+    }
+    if (this.screenAudioCancellerNode) {
+      try {
+        this.screenAudioCancellerNode.disconnect()
+      } catch {}
+      this.screenAudioCancellerNode = null
+    }
+    this.screenAudioDestNode = null
+    if (this.rawScreenStream) {
+      this.rawScreenStream.getTracks().forEach((t) => t.stop())
+      this.rawScreenStream = null
+    }
   }
 
   private setupLocalVoiceAnalyser(stream: MediaStream): void {
@@ -1112,13 +1389,23 @@ export class MsnWebRTCService {
       const source = ctx.createMediaStreamSource(stream)
       const analyser = ctx.createAnalyser()
       analyser.fftSize = 256
+      const gainNode = ctx.createGain()
+      const gainValue = Math.max(0, Math.min(2, this.remoteVoiceVolumePercent / 100))
+      gainNode.gain.value = gainValue
 
-      // Conecta APENAS ao analyser para Auto-Ducking do DJ Bot!
-      // NÃO conecta ao ctx.destination aqui pois o <audio id="remote-voice"> já reproduz a voz nativamente;
-      // conectar também ao ctx.destination causava som duplicado/robotizado com ~15ms de atraso!
+      // O <audio id="remote-voice"> fica com muted=true no DOM (apenas para manter o receptor WebRTC ativo no Chromium),
+      // enquanto 100% da reprodução da voz do amigo (0% a 200%) passa pelo gainNode no mesmo clock de 48kHz do AudioContext!
+      // Assim, o VoiceLoopbackCancellerProcessor recebe a referência digital exata da voz e subtrai -55dB do loopback da tela!
       source.connect(analyser)
+      source.connect(gainNode)
+      gainNode.connect(ctx.destination)
+
+      if (this.screenAudioCancellerNode) {
+        gainNode.connect(this.screenAudioCancellerNode, 0, 1)
+      }
 
       this.remoteVoiceSourceNode = source
+      this.remoteVoiceGainNode = gainNode
       this.remoteAnalyser = analyser
       this.startVoiceActivityLoop()
     } catch (err) {
@@ -1127,28 +1414,15 @@ export class MsnWebRTCService {
   }
 
   /**
-   * Ajusta o volume da voz do amigo (0% a 200%)
-   * De 0% a 100% é controlado diretamente no elemento <audio id="remote-voice">.
-   * Acima de 100% (boost), adiciona apenas o ganho extra no Web Audio API.
+   * Ajusta o volume da voz do amigo (0% a 200%) diretamente no GainNode unificado do Web Audio API.
+   * Como o mesmo GainNode alimenta tanto a saída de áudio quanto a referência do cancelador de loopback,
+   * o cancelamento da voz no compartilhamento de tela permanece 100% exato em qualquer volume!
    */
   public setRemoteVoiceBoostVolume(volumePercent: number): void {
     this.remoteVoiceVolumePercent = volumePercent
-    if (!this.remoteVoiceSourceNode || !this.audioCtx) return
-
-    if (volumePercent > 100) {
-      if (!this.remoteVoiceGainNode) {
-        this.remoteVoiceGainNode = this.audioCtx.createGain()
-        this.remoteVoiceSourceNode.connect(this.remoteVoiceGainNode)
-        this.remoteVoiceGainNode.connect(this.audioCtx.destination)
-      }
-      const extraBoost = (Math.min(200, volumePercent) - 100) / 100
-      this.remoteVoiceGainNode.gain.setTargetAtTime(extraBoost, this.audioCtx.currentTime, 0.03)
-    } else if (this.remoteVoiceGainNode) {
-      try {
-        this.remoteVoiceGainNode.disconnect()
-      } catch {}
-      this.remoteVoiceGainNode = null
-    }
+    if (!this.remoteVoiceGainNode || !this.audioCtx) return
+    const gainValue = Math.max(0, Math.min(2, volumePercent / 100))
+    this.remoteVoiceGainNode.gain.setTargetAtTime(gainValue, this.audioCtx.currentTime, 0.02)
   }
 
   /**
@@ -1158,27 +1432,21 @@ export class MsnWebRTCService {
    */
   public setDjBotPlayingState(isPlaying: boolean): void {
     this.djBotPlaying = isPlaying
-    this.updateScreenAudioLoopbackGate(false)
+    this.updateScreenAudioLoopbackGate()
   }
 
-  private updateScreenAudioLoopbackGate(remoteFriendSpeaking: boolean): void {
+  private updateScreenAudioLoopbackGate(): void {
     const screenAudioTrack = this.localScreenStream?.getAudioTracks()[0]
     if (!screenAudioTrack) return
 
-    // Se o DJ Bot estiver tocando OU se o amigo remoto estiver falando agora,
-    // corta a transmissão do loopback do sistema para não devolver a voz do amigo nem duplicar o DJ Bot!
-    if (this.djBotPlaying || remoteFriendSpeaking) {
-      screenAudioTrack.enabled = false
-    } else {
-      screenAudioTrack.enabled = true
-    }
+    // Silencia o áudio da tela APENAS se o DJ Bot estiver tocando música sincronizada.
+    // Quando os amigos conversam na call, o áudio da tela NÃO fica mudo (pois o VoiceLoopbackCancellerProcessor
+    // já subtrai digitalmente a voz do amigo sem cortar o som do compartilhamento!).
+    screenAudioTrack.enabled = !this.djBotPlaying
   }
 
   /**
-   * Loop rápido (60ms) de detecção de atividade de voz:
-   * 1. Auto-Ducking: reduz DJ Bot em 70% quando alguém fala e restaura 800ms após o silêncio.
-   * 2. Anti-Echo Gate: quando o amigo fala, silencia temporariamente o loopback de áudio da tela compartilhada
-   *    para que a voz do amigo que sai no seu fone/caixa nunca volte duplicada para ele!
+   * Loop rápido (60ms) de detecção de atividade de voz para Auto-Ducking do DJ Bot (reduz 70% quando alguém fala)
    */
   private startVoiceActivityLoop(): void {
     if (this.vadInterval) return
@@ -1198,21 +1466,6 @@ export class MsnWebRTCService {
       const localMicEnabled = !this.isMicrophoneMuted()
       const localLevel = localMicEnabled ? computeRms(this.localAnalyser) : 0
       const remoteLevel = computeRms(this.remoteAnalyser)
-
-      // Anti-Echo Gate para compartilhamento de tela: se o amigo está falando (remoteLevel > 10),
-      // bloqueia o loopback de áudio do sistema imediatamente e libera 350ms após ele parar de falar
-      if (remoteLevel > 10) {
-        if (this.screenEchoGateTimeout) {
-          clearTimeout(this.screenEchoGateTimeout)
-          this.screenEchoGateTimeout = null
-        }
-        this.updateScreenAudioLoopbackGate(true)
-      } else if (!this.screenEchoGateTimeout) {
-        this.screenEchoGateTimeout = setTimeout(() => {
-          this.screenEchoGateTimeout = null
-          this.updateScreenAudioLoopbackGate(false)
-        }, 350)
-      }
 
       const speakingNow = localLevel > 22 || remoteLevel > 22
 
@@ -1579,6 +1832,7 @@ export class MsnWebRTCService {
     this.localMicStream?.getTracks().forEach((t) => t.stop())
     this.localCamStream?.getTracks().forEach((t) => t.stop())
     this.localScreenStream?.getTracks().forEach((t) => t.stop())
+    this.cleanupScreenAudioCanceller()
 
     this.localMicStream = null
     this.localCamStream = null

@@ -18,7 +18,9 @@ import {
   Sparkles,
   LogOut,
   Download,
-  ShieldCheck
+  ShieldCheck,
+  Maximize2,
+  Minimize2
 } from 'lucide-react'
 import {
   MsnWebRTCService,
@@ -141,6 +143,7 @@ const MainMsnMessengerWindow: React.FC = () => {
   const [isCamEnabled, setIsCamEnabled] = useState<boolean>(true)
   const [ecoMode, setEcoMode] = useState<boolean>(false)
   const [isWindowVisible, setIsWindowVisible] = useState<boolean>(true)
+  const [isCallFullscreen, setIsCallFullscreen] = useState<boolean>(false)
 
   // Mixers Independentes: Voz do Amigo (0% a 200% Boost) e Volume do Filme/Tela (0% a 100%)
   const [friendVoiceVolume, setFriendVoiceVolume] = useState<number>(100)
@@ -242,9 +245,14 @@ const MainMsnMessengerWindow: React.FC = () => {
       setUpdaterInfo(payload)
     })
 
+    const unsubFullscreen = window.msnApi.onFullscreenChanged((isFull) => {
+      setIsCallFullscreen(isFull)
+    })
+
     return () => {
       unsubVisibility()
       unsubUpdater()
+      unsubFullscreen()
     }
   }, [])
 
@@ -254,8 +262,9 @@ const MainMsnMessengerWindow: React.FC = () => {
   const syncMediaElementsWithVisibility = useCallback(() => {
     const st = streamsRef.current
 
-    // O <audio id="remote-voice"> SEMPRE permanece conectado mesmo minimizado durante jogos
+    // O <audio id="remote-voice"> SEMPRE permanece conectado (com muted=true pois o Web Audio API faz o output unificado de 0% a 200% e cancelamento de eco)
     if (remoteVoiceAudioRef.current) {
+      remoteVoiceAudioRef.current.muted = true
       if (remoteVoiceAudioRef.current.srcObject !== st.remoteVoice) {
         remoteVoiceAudioRef.current.srcObject = st.remoteVoice
         remoteVoiceAudioRef.current.play().catch(() => {})
@@ -312,10 +321,34 @@ const MainMsnMessengerWindow: React.FC = () => {
   }, [screenMovieVolume, isScreenSharing, remoteScreenSharing, djState.isPlaying])
 
   useEffect(() => {
-    if (remoteVoiceAudioRef.current) {
-      remoteVoiceAudioRef.current.volume = Math.max(0, Math.min(1, friendVoiceVolume / 100))
-    }
+    webrtcRef.current?.setRemoteVoiceBoostVolume(friendVoiceVolume)
   }, [friendVoiceVolume, inCall])
+
+  // Sai automaticamente da Tela Cheia quando a ligação é encerrada, e suporta tecla Esc / F11 na chamada
+  useEffect(() => {
+    if (!inCall && isCallFullscreen) {
+      window.msnApi.setFullscreen(false).catch(() => {})
+      setIsCallFullscreen(false)
+    }
+  }, [inCall, isCallFullscreen])
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent): void => {
+      if (!inCall) return
+      if (e.key === 'Escape' && isCallFullscreen) {
+        window.msnApi.setFullscreen(false).catch(() => {})
+      } else if (e.key === 'F11') {
+        e.preventDefault()
+        window.msnApi.toggleFullscreen().catch(() => {})
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [inCall, isCallFullscreen])
+
+  const handleToggleCallFullscreen = (): void => {
+    window.msnApi.toggleFullscreen().catch(() => {})
+  }
 
   // ==========================================================================
   // 3. INICIALIZAR SERVIÇO WEBRTC APÓS LOGIN
@@ -890,8 +923,8 @@ const MainMsnMessengerWindow: React.FC = () => {
 
   return (
     <div className="h-screen w-screen msn-window-bg flex flex-col overflow-hidden select-none">
-      {/* ELEMENTO <audio id="remote-voice"> ISOLADO PARA A VOZ DO AMIGO (ZERO DUPLICAÇÃO / ZERO VOZ ROBÓTICA) */}
-      <audio id="remote-voice" ref={remoteVoiceAudioRef} autoPlay playsInline />
+      {/* ELEMENTO <audio id="remote-voice"> MUTADO NO DOM (MANTÉM STREAM WEBRTC ATIVO ENQUANTO O WEB AUDIO API REPRODUZ E CANCELA LOOPBACK) */}
+      <audio id="remote-voice" ref={remoteVoiceAudioRef} autoPlay playsInline muted />
 
       {/* MODAL DE SELEÇÃO DE JANELA / TELA (desktopCapturer) */}
       <ScreenShareModal
@@ -904,9 +937,10 @@ const MainMsnMessengerWindow: React.FC = () => {
       />
 
       {/* ==================================================================== */}
-      {/* CABEÇALHO E SUBNICK MUSICAL (TELA 2)                                 */}
+      {/* CABEÇALHO E SUBNICK MUSICAL (OCULTADO EM TELA CHEIA NA LIGAÇÃO)      */}
       {/* ==================================================================== */}
-      <header className="msn-header-gradient px-4 py-2 text-white flex items-center justify-between shrink-0">
+      {!(inCall && isCallFullscreen) && (
+        <header className="msn-header-gradient px-4 py-2 text-white flex items-center justify-between shrink-0">
         <div className="flex items-center gap-3 min-w-0">
           {/* Bolinha de Status do Amigo (Verde = Online, Vermelho = Ocupado, Cinza = Offline) */}
           <span
@@ -976,11 +1010,13 @@ const MainMsnMessengerWindow: React.FC = () => {
           </button>
         </div>
       </header>
+      )}
 
       {/* ==================================================================== */}
-      {/* BARRA DE TOPO: OS 7 BOTÕES GRANDES ESTILO MSN                        */}
+      {/* BARRA DE TOPO: OS 7 BOTÕES GRANDES ESTILO MSN (OCULTADA EM TELA CHEIA) */}
       {/* ==================================================================== */}
-      <nav className="msn-toolbar-gradient px-3 py-1.5 flex flex-wrap items-center justify-between gap-1.5 shrink-0">
+      {!(inCall && isCallFullscreen) && (
+        <nav className="msn-toolbar-gradient px-3 py-1.5 flex flex-wrap items-center justify-between gap-1.5 shrink-0">
         <div className="flex flex-wrap items-center gap-1.5">
           {/* 1. Ligar Vídeo */}
           <button
@@ -1088,6 +1124,7 @@ const MainMsnMessengerWindow: React.FC = () => {
           </button>
         </div>
       </nav>
+      )}
 
       {/* BANNER DE STATUS DO AUTO-UPDATER NA TELA DE CHAT */}
       {updaterInfo.status !== 'idle' && (
@@ -1232,6 +1269,35 @@ const MainMsnMessengerWindow: React.FC = () => {
                 </span>
               </div>
 
+              {/* Botão Rápido de Tela Cheia no Canto Superior Direito (Modo Cinema) */}
+              <div
+                onClick={(e) => e.stopPropagation()}
+                className={`absolute top-4 right-4 z-30 transition-opacity duration-300 ${
+                  cinemaControlsVisible
+                    ? 'opacity-100 pointer-events-auto'
+                    : 'opacity-0 pointer-events-none'
+                }`}
+              >
+                <button
+                  type="button"
+                  onClick={handleToggleCallFullscreen}
+                  className="px-3 py-1.5 rounded-xl bg-slate-900/90 hover:bg-slate-800 border border-slate-600 text-white text-xs font-bold flex items-center gap-1.5 shadow-xl transition"
+                  title="Alternar Tela Cheia (F11 ou ESC)"
+                >
+                  {isCallFullscreen ? (
+                    <>
+                      <Minimize2 className="w-3.5 h-3.5 text-sky-400" />
+                      Sair da Tela Cheia
+                    </>
+                  ) : (
+                    <>
+                      <Maximize2 className="w-3.5 h-3.5 text-sky-400" />
+                      Tela Cheia
+                    </>
+                  )}
+                </button>
+              </div>
+
               {/* Barra Flutuante + Mixer de Áudio Independente (Auto-Hide após 3 segundos sem mexer o mouse) */}
               <div
                 onClick={(e) => e.stopPropagation()}
@@ -1331,6 +1397,29 @@ const MainMsnMessengerWindow: React.FC = () => {
 
                   <button
                     type="button"
+                    onClick={handleToggleCallFullscreen}
+                    className={`px-3 py-2 rounded-xl border text-xs font-bold flex items-center gap-1.5 ${
+                      isCallFullscreen
+                        ? 'bg-sky-600/80 border-sky-400 text-white'
+                        : 'bg-slate-800 hover:bg-slate-700 border-slate-600 text-white'
+                    }`}
+                    title="Alternar Tela Cheia (F11 / Esc)"
+                  >
+                    {isCallFullscreen ? (
+                      <>
+                        <Minimize2 className="w-4 h-4 text-sky-200" />
+                        <span>Sair da Tela Cheia</span>
+                      </>
+                    ) : (
+                      <>
+                        <Maximize2 className="w-4 h-4 text-sky-400" />
+                        <span>Tela Cheia</span>
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={() => webrtcRef.current?.rejectOrHangupCall()}
                     className="px-3.5 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold flex items-center gap-1.5"
                   >
@@ -1344,7 +1433,30 @@ const MainMsnMessengerWindow: React.FC = () => {
             /* ================================================================ */
             /* TELA 3: LIGAÇÃO DE VÍDEO (1x1)                                   */
             /* ================================================================ */
-            <div className="relative w-full h-full bg-slate-950 overflow-hidden flex items-center justify-center">
+            <div
+              onDoubleClick={handleToggleCallFullscreen}
+              className="relative w-full h-full bg-slate-950 overflow-hidden flex items-center justify-center"
+            >
+              {/* Botão Rápido de Tela Cheia no Canto Superior Direito */}
+              <button
+                type="button"
+                onClick={handleToggleCallFullscreen}
+                className="absolute top-4 right-4 z-30 px-3 py-1.5 rounded-xl bg-slate-900/80 hover:bg-slate-800 border border-slate-600 text-white text-xs font-bold flex items-center gap-1.5 shadow-lg"
+                title="Alternar Tela Cheia (F11 ou Duplo Clique)"
+              >
+                {isCallFullscreen ? (
+                  <>
+                    <Minimize2 className="w-3.5 h-3.5 text-sky-300" />
+                    <span>Sair da Tela Cheia</span>
+                  </>
+                ) : (
+                  <>
+                    <Maximize2 className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Tela Cheia</span>
+                  </>
+                )}
+              </button>
+
               {/* Câmera do Amigo em proporção natural 16:9 Widescreen sem zoom/corte (object-contain) */}
               <video
                 ref={remoteCamVideoRef}
@@ -1441,6 +1553,29 @@ const MainMsnMessengerWindow: React.FC = () => {
                     {friendVoiceVolume}%
                   </span>
                 </div>
+
+                <button
+                  type="button"
+                  onClick={handleToggleCallFullscreen}
+                  className={`px-3 py-2 rounded-xl border text-xs font-bold flex items-center gap-1.5 ${
+                    isCallFullscreen
+                      ? 'bg-sky-600/80 border-sky-400 text-white'
+                      : 'bg-slate-800 hover:bg-slate-700 border-slate-600 text-white'
+                  }`}
+                  title="Alternar Tela Cheia (F11 / Esc)"
+                >
+                  {isCallFullscreen ? (
+                    <>
+                      <Minimize2 className="w-4 h-4 text-sky-200" />
+                      <span>Sair da Tela Cheia</span>
+                    </>
+                  ) : (
+                    <>
+                      <Maximize2 className="w-4 h-4 text-sky-400" />
+                      <span>Tela Cheia</span>
+                    </>
+                  )}
+                </button>
 
                 <button
                   type="button"

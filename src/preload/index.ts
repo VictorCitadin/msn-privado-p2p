@@ -65,6 +65,17 @@ const msnApi = {
   // Janela do Rankeador de Álbuns (1080x760)
   openAlbumRanker: (): Promise<boolean> => ipcRenderer.invoke('open-album-ranker'),
 
+  // Tela Cheia (Fullscreen) para Ligações
+  toggleFullscreen: (): Promise<boolean> => ipcRenderer.invoke('window:toggle-fullscreen'),
+  setFullscreen: (fullscreen: boolean): Promise<boolean> =>
+    ipcRenderer.invoke('window:set-fullscreen', fullscreen),
+  onFullscreenChanged: (callback: (isFullscreen: boolean) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, isFullscreen: boolean): void =>
+      callback(isFullscreen)
+    ipcRenderer.on('window-fullscreen-changed', handler)
+    return () => ipcRenderer.removeListener('window-fullscreen-changed', handler)
+  },
+
   // Chamar Atenção (Tremer janela física)
   nudgeWindow: (): Promise<boolean> => ipcRenderer.invoke('nudge-window'),
 
