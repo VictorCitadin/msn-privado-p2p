@@ -258,6 +258,7 @@ const MainMsnMessengerWindow: React.FC = () => {
     if (remoteVoiceAudioRef.current) {
       if (remoteVoiceAudioRef.current.srcObject !== st.remoteVoice) {
         remoteVoiceAudioRef.current.srcObject = st.remoteVoice
+        remoteVoiceAudioRef.current.play().catch(() => {})
       }
     }
 
@@ -272,9 +273,11 @@ const MainMsnMessengerWindow: React.FC = () => {
     // Restaura instantaneamente ao focar/mostrar a janela
     if (localCamVideoRef.current && localCamVideoRef.current.srcObject !== st.localCam) {
       localCamVideoRef.current.srcObject = st.localCam
+      localCamVideoRef.current.play().catch(() => {})
     }
     if (remoteCamVideoRef.current && remoteCamVideoRef.current.srcObject !== st.remoteCam) {
       remoteCamVideoRef.current.srcObject = st.remoteCam
+      remoteCamVideoRef.current.play().catch(() => {})
     }
 
     const activeScreenStream = st.remoteScreen || st.localScreen
@@ -283,6 +286,7 @@ const MainMsnMessengerWindow: React.FC = () => {
       remoteScreenVideoRef.current.srcObject !== activeScreenStream
     ) {
       remoteScreenVideoRef.current.srcObject = activeScreenStream
+      remoteScreenVideoRef.current.play().catch(() => {})
     }
   }, [isWindowVisible])
 
@@ -296,12 +300,18 @@ const MainMsnMessengerWindow: React.FC = () => {
     syncMediaElementsWithVisibility
   ])
 
-  // Ajusta o volume do filme/tela compartilhada (0% a 100%)
+  // Ajusta o volume do filme/tela compartilhada (0% a 100%) e da voz do amigo
   useEffect(() => {
     if (remoteScreenVideoRef.current) {
       remoteScreenVideoRef.current.volume = Math.max(0, Math.min(1, screenMovieVolume / 100))
     }
   }, [screenMovieVolume, isScreenSharing, remoteScreenSharing])
+
+  useEffect(() => {
+    if (remoteVoiceAudioRef.current) {
+      remoteVoiceAudioRef.current.volume = Math.max(0, Math.min(1, friendVoiceVolume / 100))
+    }
+  }, [friendVoiceVolume, inCall])
 
   // ==========================================================================
   // 3. INICIALIZAR SERVIÇO WEBRTC APÓS LOGIN
@@ -876,7 +886,7 @@ const MainMsnMessengerWindow: React.FC = () => {
 
   return (
     <div className="h-screen w-screen msn-window-bg flex flex-col overflow-hidden select-none">
-      {/* ELEMENTO <audio id="remote-voice"> ISOLADO PARA A VOZ DO AMIGO (ZERO ECO) */}
+      {/* ELEMENTO <audio id="remote-voice"> ISOLADO PARA A VOZ DO AMIGO (ZERO DUPLICAÇÃO / ZERO VOZ ROBÓTICA) */}
       <audio id="remote-voice" ref={remoteVoiceAudioRef} autoPlay playsInline />
 
       {/* MODAL DE SELEÇÃO DE JANELA / TELA (desktopCapturer) */}

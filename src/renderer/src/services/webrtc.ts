@@ -215,7 +215,10 @@ export class MsnWebRTCService {
 
   // Web Audio API para Boost de Voz até 200% e Detecção de Voz (Auto-Ducking DJ Bot)
   private audioCtx: AudioContext | null = null
+  private localVoiceSourceNode: MediaStreamAudioSourceNode | null = null
+  private remoteVoiceSourceNode: MediaStreamAudioSourceNode | null = null
   private remoteVoiceGainNode: GainNode | null = null
+  private remoteVoiceVolumePercent = 100
   private vadInterval: ReturnType<typeof setInterval> | null = null
   private localAnalyser: AnalyserNode | null = null
   private remoteAnalyser: AnalyserNode | null = null
@@ -377,46 +380,80 @@ export class MsnWebRTCService {
       const track = event.track
       const stream = event.streams[0] || new MediaStream([track])
 
-      if (track.kind === 'audio') {
-        // Distingue estritamente o Microfone do Amigo vs Áudio do Filme/Tela Compartilhada
-        const isScreenAudio =
-          (this.remoteStreamIds.screenStreamId &&
-            stream.id === this.remoteStreamIds.screenStreamId) ||
-          track.label.toLowerCase().includes('screen') ||
-          track.label.toLowerCase().includes('system') ||
-          track.label.toLowerCase().includes('loopback')
+      const routeTrack = (): void => {
+        if (track.kind === 'audio') {
+          const hasExistingLiveMic = Boolean(
+            this.remoteVoiceStream &&
+              this.remoteVoiceStream
+                .getAudioTracks()
+                .some((t) => t.readyState === 'live' && t.id !== track.id)
+          )
 
-        if (isScreenAudio) {
-          if (!this.remoteScreenStream) {
-            this.remoteScreenStream = new MediaStream()
-          }
-          this.remoteScreenStream.addTrack(track)
-        } else {
-          this.remoteVoiceStream = new MediaStream([track])
-          this.setupRemoteVoiceAnalyser(this.remoteVoiceStream)
-        }
-      } else if (track.kind === 'video') {
-        const isScreenVideo =
-          (this.remoteStreamIds.screenStreamId &&
-            stream.id === this.remoteStreamIds.screenStreamId) ||
-          track.label.toLowerCase().includes('screen') ||
-          track.label.toLowerCase().includes('window') ||
-          track.label.toLowerCase().includes('display')
+          const isScreenAudio =
+            (this.remoteStreamIds.screenStreamId &&
+              stream.id === this.remoteStreamIds.screenStreamId) ||
+            (this.remoteStreamIds.micStreamId &&
+              stream.id !== this.remoteStreamIds.micStreamId &&
+              hasExistingLiveMic) ||
+            hasExistingLiveMic ||
+            track.label.toLowerCase().includes('screen') ||
+            track.label.toLowerCase().includes('system') ||
+            track.label.toLowerCase().includes('loopback')
 
-        if (isScreenVideo) {
-          if (!this.remoteScreenStream) {
-            this.remoteScreenStream = new MediaStream()
+          if (isScreenAudio) {
+            if (!this.remoteScreenStream) {
+              this.remoteScreenStream = new MediaStream()
+            }
+            if (!this.remoteScreenStream.getAudioTracks().some((t) => t.id === track.id)) {
+              this.remoteScreenStream.addTrack(track)
+            }
+          } else {
+            this.remoteVoiceStream = new MediaStream([track])
+            this.setupRemoteVoiceAnalyser(this.remoteVoiceStream)
           }
-          // Remove tracks de vídeo antigas se houver
-          this.remoteScreenStream.getVideoTracks().forEach((t) => this.remoteScreenStream?.removeTrack(t))
-          this.remoteScreenStream.addTrack(track)
-        } else {
-          this.remoteCamStream = new MediaStream([track])
+        } else if (track.kind === 'video') {
+          const hasExistingLiveCam = Boolean(
+            this.remoteCamStream &&
+              this.remoteCamStream
+                .getVideoTracks()
+                .some((t) => t.readyState === 'live' && t.id !== track.id)
+          )
+
+          const isScreenVideo =
+            (this.remoteStreamIds.screenStreamId &&
+              stream.id === this.remoteStreamIds.screenStreamId) ||
+            (this.remoteStreamIds.camStreamId &&
+              stream.id !== this.remoteStreamIds.camStreamId &&
+              hasExistingLiveCam) ||
+            hasExistingLiveCam ||
+            track.label.toLowerCase().includes('screen') ||
+            track.label.toLowerCase().includes('window') ||
+            track.label.toLowerCase().includes('display')
+
+          if (isScreenVideo) {
+            if (!this.remoteScreenStream) {
+              this.remoteScreenStream = new MediaStream()
+            }
+            this.remoteScreenStream
+              .getVideoTracks()
+              .filter((t) => t.id !== track.id)
+              .forEach((t) => this.remoteScreenStream?.removeTrack(t))
+            if (!this.remoteScreenStream.getVideoTracks().some((t) => t.id === track.id)) {
+              this.remoteScreenStream.addTrack(track)
+            }
+          } else {
+            this.remoteCamStream = new MediaStream([track])
+          }
         }
+
+        this.emitStreamsUpdated()
+        this.emitCallState()
       }
 
-      this.emitStreamsUpdated()
-      this.emitCallState()
+      routeTrack()
+      track.onunmute = () => {
+        routeTrack()
+      }
     }
 
     pc.onconnectionstatechange = () => {
@@ -640,10 +677,17 @@ export class MsnWebRTCService {
     const pc = this.ensurePeerConnection()
 
     try {
-      await pc.setRemoteDescription(new RTCSessionDescription(offerToAccept))
-      await this.flushPendingIceCandidates(pc)
+      // 1. Anexa as tracks locais ANTES do setRemoteDescription para o WebRTC associar como sendrecv
       this.attachLocalStreamsToPeer(pc)
 
+      // 2. Aplica a oferta remota do amigo e descarrega candidatos ICE pendentes
+      await pc.setRemoteDescription(new RTCSessionDescription(offerToAccept))
+      await this.flushPendingIceCandidates(pc)
+
+      // 3. Garante que todas as tracks locais (mic e câmera) estejam vinculadas em modo sendrecv nos transceivers ativos
+      await this.ensureTransceiversSendRecv(pc)
+
+      // 4. Cria e envia o SDP Answer
       const answer = await pc.createAnswer()
       await this.setLocalDescriptionSafe(pc, answer)
 
@@ -652,12 +696,55 @@ export class MsnWebRTCService {
         sdp: pc.localDescription,
         streamIds: this.getLocalStreamIds()
       })
+
+      // 5. Dispara renegociação complementar após 600ms para garantir que ambas as pontas recebam 100% das tracks
+      setTimeout(() => {
+        if (this.inCall && this.peerConnection?.signalingState === 'stable') {
+          this.renegotiatePeerConnection().catch(() => {})
+        }
+      }, 600)
     } catch (err) {
       console.error('[WebRTC] Erro ao aceitar chamada:', err)
     }
 
     this.emitStreamsUpdated()
     this.emitCallState()
+  }
+
+  private async ensureTransceiversSendRecv(pc: RTCPeerConnection): Promise<void> {
+    const transceivers = pc.getTransceivers()
+    const micTrack = this.localMicStream?.getAudioTracks()[0]
+    const camTrack = this.localCamStream?.getVideoTracks()[0]
+
+    if (micTrack) {
+      const alreadySendingAudio = pc
+        .getSenders()
+        .some((s) => s.track && s.track.id === micTrack.id)
+      const audioTransceiver = transceivers.find(
+        (t) => t.receiver.track?.kind === 'audio' && (!t.sender.track || t.direction === 'recvonly')
+      )
+      if (audioTransceiver) {
+        await audioTransceiver.sender.replaceTrack(micTrack).catch(() => {})
+        audioTransceiver.direction = 'sendrecv'
+      } else if (!alreadySendingAudio && this.localMicStream) {
+        pc.addTrack(micTrack, this.localMicStream)
+      }
+    }
+
+    if (camTrack) {
+      const alreadySendingVideo = pc
+        .getSenders()
+        .some((s) => s.track && s.track.id === camTrack.id)
+      const videoTransceiver = transceivers.find(
+        (t) => t.receiver.track?.kind === 'video' && (!t.sender.track || t.direction === 'recvonly')
+      )
+      if (videoTransceiver) {
+        await videoTransceiver.sender.replaceTrack(camTrack).catch(() => {})
+        videoTransceiver.direction = 'sendrecv'
+      } else if (!alreadySendingVideo && this.localCamStream) {
+        pc.addTrack(camTrack, this.localCamStream)
+      }
+    }
   }
 
   public rejectOrHangupCall(): void {
@@ -985,10 +1072,16 @@ export class MsnWebRTCService {
   private setupLocalVoiceAnalyser(stream: MediaStream): void {
     try {
       const ctx = this.ensureAudioContext()
+      if (this.localVoiceSourceNode) {
+        try {
+          this.localVoiceSourceNode.disconnect()
+        } catch {}
+      }
       const source = ctx.createMediaStreamSource(stream)
       const analyser = ctx.createAnalyser()
       analyser.fftSize = 256
       source.connect(analyser)
+      this.localVoiceSourceNode = source
       this.localAnalyser = analyser
       this.startVoiceActivityLoop()
     } catch (err) {
@@ -999,31 +1092,58 @@ export class MsnWebRTCService {
   private setupRemoteVoiceAnalyser(stream: MediaStream): void {
     try {
       const ctx = this.ensureAudioContext()
+      if (this.remoteVoiceSourceNode) {
+        try {
+          this.remoteVoiceSourceNode.disconnect()
+        } catch {}
+        this.remoteVoiceSourceNode = null
+      }
+      if (this.remoteVoiceGainNode) {
+        try {
+          this.remoteVoiceGainNode.disconnect()
+        } catch {}
+        this.remoteVoiceGainNode = null
+      }
+
       const source = ctx.createMediaStreamSource(stream)
       const analyser = ctx.createAnalyser()
       analyser.fftSize = 256
-      const gainNode = ctx.createGain()
-      gainNode.gain.value = 1.0 // 100% padrão (suporta até 2.0 = 200% boost)
 
+      // Conecta APENAS ao analyser para Auto-Ducking do DJ Bot!
+      // NÃO conecta ao ctx.destination aqui pois o <audio id="remote-voice"> já reproduz a voz nativamente;
+      // conectar também ao ctx.destination causava som duplicado/robotizado com ~15ms de atraso!
       source.connect(analyser)
-      source.connect(gainNode)
-      gainNode.connect(ctx.destination)
 
+      this.remoteVoiceSourceNode = source
       this.remoteAnalyser = analyser
-      this.remoteVoiceGainNode = gainNode
       this.startVoiceActivityLoop()
     } catch (err) {
-      console.warn('[WebRTC] Falha ao iniciar boost/analyser de voz remota:', err)
+      console.warn('[WebRTC] Falha ao iniciar analyser de voz remota:', err)
     }
   }
 
   /**
-   * Ajusta o volume da voz do amigo de 0% a 200% (0.0 a 2.0) usando GainNode da Web Audio API
+   * Ajusta o volume da voz do amigo (0% a 200%)
+   * De 0% a 100% é controlado diretamente no elemento <audio id="remote-voice">.
+   * Acima de 100% (boost), adiciona apenas o ganho extra no Web Audio API.
    */
   public setRemoteVoiceBoostVolume(volumePercent: number): void {
-    if (this.remoteVoiceGainNode && this.audioCtx) {
-      const normalized = Math.max(0, Math.min(200, volumePercent)) / 100
-      this.remoteVoiceGainNode.gain.setTargetAtTime(normalized, this.audioCtx.currentTime, 0.03)
+    this.remoteVoiceVolumePercent = volumePercent
+    if (!this.remoteVoiceSourceNode || !this.audioCtx) return
+
+    if (volumePercent > 100) {
+      if (!this.remoteVoiceGainNode) {
+        this.remoteVoiceGainNode = this.audioCtx.createGain()
+        this.remoteVoiceSourceNode.connect(this.remoteVoiceGainNode)
+        this.remoteVoiceGainNode.connect(this.audioCtx.destination)
+      }
+      const extraBoost = (Math.min(200, volumePercent) - 100) / 100
+      this.remoteVoiceGainNode.gain.setTargetAtTime(extraBoost, this.audioCtx.currentTime, 0.03)
+    } else if (this.remoteVoiceGainNode) {
+      try {
+        this.remoteVoiceGainNode.disconnect()
+      } catch {}
+      this.remoteVoiceGainNode = null
     }
   }
 

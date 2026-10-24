@@ -28,6 +28,22 @@ export interface MsnBridgeApi {
     durationSeconds: number
     thumbnail: string
   }>
+  syncDjPlayer: (payload: {
+    videoId: string | null
+    isPlaying: boolean
+    volume: number
+    seekSeconds?: number
+    seekTimestamp?: number
+  }) => Promise<boolean>
+  onDjBotTimeUpdate: (
+    callback: (payload: {
+      videoId: string
+      currentTime: number
+      duration: number
+      paused: boolean
+      ended: boolean
+    }) => void
+  ) => () => void
   searchAlbums: (query: string) => Promise<AlbumSearchResult[]>
   getAlbumTracks: (albumId: string) => Promise<{
     albumId: string

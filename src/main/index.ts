@@ -93,6 +93,23 @@ const store = new Store<StoreSchema>({
 
 let mainWindow: BrowserWindow | null = null
 let rankerWindow: BrowserWindow | null = null
+let djPlayerWindow: BrowserWindow | null = null
+let djProgressTimer: ReturnType<typeof setInterval> | null = null
+let djTargetState: {
+  videoId: string | null
+  isPlaying: boolean
+  volume: number
+  lastSeekTimestamp: number
+  seekSeconds: number
+} = {
+  videoId: null,
+  isPlaying: false,
+  volume: 75,
+  lastSeekTimestamp: 0,
+  seekSeconds: 0
+}
+let djLoadedVideoId: string | null = null
+let djAppliedSeekTimestamp = 0
 let tray: Tray | null = null
 let isQuitting = false
 let localRendererServerUrl: string | null = null
@@ -222,7 +239,7 @@ function createMsnTrayIcon(): Electron.NativeImage {
 }
 
 // ============================================================================
-// 4. CONFIGURAÇÃO ANTI-403 DO YOUTUBE PARA O DJ BOT (WMP)
+// 4. MOTOR DE ÁUDIO OCULTO DO DJ BOT (YOUTUBE WATCH PLAYER NATIVO SEM EMBED BLOCK)
 // ============================================================================
 function configureYouTubeHeaders(): void {
   const filter = {
@@ -236,6 +253,144 @@ function configureYouTubeHeaders(): void {
     }
     callback({ requestHeaders })
   })
+}
+
+function ensureDjPlayerWindow(): BrowserWindow {
+  if (djPlayerWindow && !djPlayerWindow.isDestroyed()) {
+    return djPlayerWindow
+  }
+
+  djPlayerWindow = new BrowserWindow({
+    width: 360,
+    height: 240,
+    show: false,
+    skipTaskbar: true,
+    webPreferences: {
+      sandbox: false,
+      contextIsolation: true,
+      nodeIntegration: false,
+      backgroundThrottling: false
+    }
+  })
+
+  djPlayerWindow.webContents.setAudioMuted(false)
+
+  djPlayerWindow.on('closed', () => {
+    djPlayerWindow = null
+    djLoadedVideoId = null
+  })
+
+  if (!djProgressTimer) {
+    djProgressTimer = setInterval(async () => {
+      if (!djPlayerWindow || djPlayerWindow.isDestroyed() || !djTargetState.videoId) return
+      try {
+        const shouldSeek = djTargetState.lastSeekTimestamp > djAppliedSeekTimestamp
+        const seekVal = djTargetState.seekSeconds
+        if (shouldSeek) {
+          djAppliedSeekTimestamp = djTargetState.lastSeekTimestamp
+        }
+
+        const targetVol = Math.max(0, Math.min(1, djTargetState.volume / 100))
+        const shouldPlay = djTargetState.isPlaying
+
+        const status = await djPlayerWindow.webContents.executeJavaScript(`
+          (() => {
+            try {
+              const moviePlayer = document.getElementById('movie_player');
+              if (moviePlayer && typeof moviePlayer.setPlaybackQualityRange === 'function') {
+                moviePlayer.setPlaybackQualityRange('tiny', 'small');
+              }
+              const skipBtn = document.querySelector('.ytp-ad-skip-button, .ytp-skip-ad-button, .ytp-ad-skip-button-modern');
+              if (skipBtn) skipBtn.click();
+
+              const adShowing = Boolean(document.querySelector('.ad-showing'));
+              const v = document.querySelector('video');
+              if (!v) return null;
+
+              if (adShowing && Number.isFinite(v.duration) && v.duration > 0) {
+                v.currentTime = v.duration;
+              }
+
+              v.muted = false;
+              v.volume = ${targetVol};
+
+              if (${shouldSeek ? 'true' : 'false'} && !adShowing && Math.abs(v.currentTime - ${seekVal}) > 4) {
+                v.currentTime = ${seekVal};
+              }
+
+              if (${shouldPlay ? 'true' : 'false'}) {
+                if (v.paused && !v.ended) {
+                  v.play().catch(() => {});
+                }
+              } else {
+                if (!v.paused) {
+                  v.pause();
+                }
+              }
+
+              return {
+                currentTime: adShowing ? 0 : Math.floor(v.currentTime || 0),
+                duration: adShowing ? 0 : Math.floor(v.duration || 0),
+                paused: v.paused,
+                ended: !adShowing && v.ended && v.currentTime > 3
+              };
+            } catch (e) {
+              return null;
+            }
+          })()
+        `)
+
+        if (status && mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('djbot:time-update', {
+            videoId: djTargetState.videoId,
+            ...status
+          })
+        }
+      } catch {
+        // página ainda carregando
+      }
+    }, 500)
+  }
+
+  return djPlayerWindow
+}
+
+function syncDjBotPlayer(payload: {
+  videoId: string | null
+  isPlaying: boolean
+  volume: number
+  seekSeconds?: number
+  seekTimestamp?: number
+}): void {
+  djTargetState.videoId = payload.videoId
+  djTargetState.isPlaying = payload.isPlaying
+  djTargetState.volume = payload.volume
+
+  if (typeof payload.seekSeconds === 'number' && payload.seekTimestamp) {
+    djTargetState.seekSeconds = payload.seekSeconds
+    djTargetState.lastSeekTimestamp = payload.seekTimestamp
+  }
+
+  if (!payload.videoId) {
+    if (djPlayerWindow && !djPlayerWindow.isDestroyed()) {
+      djPlayerWindow.loadURL('about:blank').catch(() => {})
+    }
+    djLoadedVideoId = null
+    return
+  }
+
+  const win = ensureDjPlayerWindow()
+  if (djLoadedVideoId !== payload.videoId) {
+    djLoadedVideoId = payload.videoId
+    const startParam =
+      payload.seekSeconds && payload.seekSeconds > 2 ? `&t=${Math.floor(payload.seekSeconds)}s` : ''
+    win
+      .loadURL(`https://www.youtube.com/watch?v=${payload.videoId}${startParam}`, {
+        userAgent:
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+      })
+      .catch((err) => console.warn('[DJ Bot] Erro ao carregar vídeo:', err))
+  }
 }
 
 // ============================================================================
@@ -384,6 +539,9 @@ function setupSystemTray(): void {
         isQuitting = true
         if (rankerWindow && !rankerWindow.isDestroyed()) {
           rankerWindow.close()
+        }
+        if (djPlayerWindow && !djPlayerWindow.isDestroyed()) {
+          djPlayerWindow.close()
         }
         app.quit()
       }
@@ -755,6 +913,24 @@ function registerIpcHandlers(): void {
   ipcMain.handle('resolve-dj-track', async (_event, queryOrUrl: string) => {
     return await resolveDjBotTrack(queryOrUrl)
   })
+
+  // Sincronizar reprodução real do DJ Bot no processo Main
+  ipcMain.handle(
+    'djbot:sync-player',
+    (
+      _event,
+      payload: {
+        videoId: string | null
+        isPlaying: boolean
+        volume: number
+        seekSeconds?: number
+        seekTimestamp?: number
+      }
+    ) => {
+      syncDjBotPlayer(payload)
+      return true
+    }
+  )
 
   // Busca de Álbuns (iTunes Search API + Fallback Deezer)
   ipcMain.handle('albums:search', async (_event, query: string) => {

@@ -76,7 +76,7 @@ const msnApi = {
   getDesktopSources: (): Promise<DesktopSourceItem[]> =>
     ipcRenderer.invoke('get-desktop-sources'),
 
-  // DJ Bot (YouTube / Spotify oEmbed / yt-search)
+  // DJ Bot (YouTube / Spotify oEmbed / yt-search + Motor de Áudio Nativo)
   resolveDjTrack: (
     queryOrUrl: string
   ): Promise<{
@@ -86,6 +86,37 @@ const msnApi = {
     durationSeconds: number
     thumbnail: string
   }> => ipcRenderer.invoke('resolve-dj-track', queryOrUrl),
+
+  syncDjPlayer: (payload: {
+    videoId: string | null
+    isPlaying: boolean
+    volume: number
+    seekSeconds?: number
+    seekTimestamp?: number
+  }): Promise<boolean> => ipcRenderer.invoke('djbot:sync-player', payload),
+
+  onDjBotTimeUpdate: (
+    callback: (payload: {
+      videoId: string
+      currentTime: number
+      duration: number
+      paused: boolean
+      ended: boolean
+    }) => void
+  ): (() => void) => {
+    const handler = (
+      _event: Electron.IpcRendererEvent,
+      payload: {
+        videoId: string
+        currentTime: number
+        duration: number
+        paused: boolean
+        ended: boolean
+      }
+    ): void => callback(payload)
+    ipcRenderer.on('djbot:time-update', handler)
+    return () => ipcRenderer.removeListener('djbot:time-update', handler)
+  },
 
   // Rankeador de Álbuns (iTunes Search API + Deezer Fallback + Persistência Híbrida)
   searchAlbums: (query: string): Promise<AlbumSearchResult[]> =>
