@@ -15,6 +15,11 @@ files:
   - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
 asarUnpack:
   - resources/**
+extraResources:
+  - from: resources
+    to: resources
+    filter:
+      - '**/*'
 win:
   icon: build/icon.ico
   executableName: MSNMessengerPrivado

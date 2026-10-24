@@ -15,7 +15,7 @@ import { join, extname } from 'path'
 import { createServer, Server as HttpServer } from 'http'
 import { existsSync, copyFileSync } from 'fs'
 import { readFile } from 'fs/promises'
-import { execFile } from 'child_process'
+import { execFile, spawn, ChildProcessWithoutNullStreams } from 'child_process'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { autoUpdater } from 'electron-updater'
 import Store from 'electron-store'
@@ -129,6 +129,16 @@ let djLoadedVideoId: string | null = null
 let djAppliedSeekTimestamp = 0
 let tray: Tray | null = null
 let isQuitting = false
+let loopbackProcess: ChildProcessWithoutNullStreams | null = null
+
+function stopLoopbackProcess(): void {
+  if (loopbackProcess) {
+    try {
+      loopbackProcess.kill()
+    } catch {}
+    loopbackProcess = null
+  }
+}
 let localRendererServerUrl: string | null = null
 let localHttpServer: HttpServer | null = null
 
@@ -1310,6 +1320,69 @@ function registerIpcHandlers(): void {
     isQuitting = true
     autoUpdater.quitAndInstall()
   })
+
+  // Captura Nativa de Áudio Loopback (WASAPI) excluindo o áudio do MSN Privado
+  ipcMain.handle('loopback:start', async (event) => {
+    stopLoopbackProcess()
+
+    const exeName = 'loopback-capture.exe'
+    const possiblePaths = [
+      join(app.getAppPath(), 'resources', exeName),
+      join(process.resourcesPath, exeName),
+      join(process.resourcesPath, 'resources', exeName),
+      join(__dirname, '../../resources', exeName),
+      join(__dirname, '../resources', exeName)
+    ]
+    const exePath = possiblePaths.find((p) => existsSync(p))
+    if (!exePath) {
+      console.warn('[Loopback] Executável loopback-capture.exe não encontrado nos caminhos:', possiblePaths)
+      return false
+    }
+
+    try {
+      console.log(`[Loopback] Iniciando captura nativa excluindo PID ${process.pid}: ${exePath}`)
+      const child = spawn(exePath, [String(process.pid), 'exclude'], {
+        windowsHide: true,
+        stdio: ['pipe', 'pipe', 'pipe']
+      })
+
+      loopbackProcess = child
+
+      child.stdout.on('data', (chunk: Buffer) => {
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('loopback:audio-chunk', chunk)
+        }
+      })
+
+      child.stderr.on('data', (data: Buffer) => {
+        console.warn('[Loopback STDERR]', data.toString('utf8'))
+      })
+
+      child.on('exit', (code) => {
+        console.log('[Loopback] Processo encerrado com código:', code)
+        if (loopbackProcess === child) {
+          loopbackProcess = null
+        }
+      })
+
+      child.on('error', (err) => {
+        console.error('[Loopback] Erro no processo filho:', err)
+        if (loopbackProcess === child) {
+          loopbackProcess = null
+        }
+      })
+
+      return true
+    } catch (err) {
+      console.error('[Loopback] Falha ao fazer spawn de loopback-capture.exe:', err)
+      return false
+    }
+  })
+
+  ipcMain.handle('loopback:stop', async () => {
+    stopLoopbackProcess()
+    return true
+  })
 }
 
 function setupAutoUpdater(): void {
@@ -1404,6 +1477,7 @@ if (!gotSingleInstanceLock) {
 
 app.on('before-quit', () => {
   isQuitting = true
+  stopLoopbackProcess()
   try {
     tray?.destroy()
     tray = null
@@ -1411,6 +1485,7 @@ app.on('before-quit', () => {
 })
 
 app.on('will-quit', () => {
+  stopLoopbackProcess()
   globalShortcut.unregisterAll()
   if (localHttpServer) {
     localHttpServer.close()

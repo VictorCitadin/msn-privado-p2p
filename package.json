@@ -1,6 +1,6 @@
 {
   "name": "msn-privado-p2p",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "Vitinho e Will — Messenger Privado P2P + DJ Bot + Album Ranker",
   "main": "./out/main/index.js",
   "author": "Vitinho & Will",
@@ -14,6 +14,7 @@
     "start": "electron-vite preview",
     "dev": "electron-vite dev",
     "build": "electron-vite build",
+    "build:loopback": "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /optimize+ /platform:x64 /target:exe /out:resources/loopback-capture.exe native/LoopbackCapture.cs",
     "build:win": "npm run build && electron-builder --win --x64",
     "release": "npm run build && electron-builder --win --x64 --publish always",
     "build:unpack": "npm run build && electron-builder --dir"

@@ -263,6 +263,15 @@ const msnApi = {
     ): void => callback(payload)
     ipcRenderer.on('updater:status', handler)
     return () => ipcRenderer.removeListener('updater:status', handler)
+  },
+
+  // Captura Nativa de Áudio Loopback (WASAPI com exclusão do processo do app)
+  startLoopbackCapture: (): Promise<boolean> => ipcRenderer.invoke('loopback:start'),
+  stopLoopbackCapture: (): Promise<boolean> => ipcRenderer.invoke('loopback:stop'),
+  onLoopbackAudioChunk: (callback: (chunk: Uint8Array) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, chunk: Uint8Array): void => callback(chunk)
+    ipcRenderer.on('loopback:audio-chunk', handler)
+    return () => ipcRenderer.removeListener('loopback:audio-chunk', handler)
   }
 }
 

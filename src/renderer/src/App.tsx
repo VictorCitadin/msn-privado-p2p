@@ -375,9 +375,10 @@ const MainMsnMessengerWindow: React.FC = () => {
   const syncMediaElementsWithVisibility = useCallback(() => {
     const st = streamsRef.current
 
-    // O <audio id="remote-voice"> SEMPRE permanece conectado (com muted=true pois o Web Audio API faz o output unificado de 0% a 200% e cancelamento de eco)
+    // O <audio id="remote-voice"> reproduz diretamente a voz do amigo com estabilidade absoluta e latência zero
     if (remoteVoiceAudioRef.current) {
-      remoteVoiceAudioRef.current.muted = true
+      remoteVoiceAudioRef.current.muted = false
+      remoteVoiceAudioRef.current.volume = 1.0
       if (remoteVoiceAudioRef.current.srcObject !== st.remoteVoice) {
         remoteVoiceAudioRef.current.srcObject = st.remoteVoice
         remoteVoiceAudioRef.current.play().catch(() => {})
@@ -622,6 +623,12 @@ const MainMsnMessengerWindow: React.FC = () => {
     webrtcRef.current = service
     service.setEcoMode(ecoMode)
     service.setPreferredDevices(selectedAudioDeviceId, selectedVideoDeviceId).catch(() => {})
+
+    const handleUserInteraction = (): void => {
+      service.resumeAudioContext()
+    }
+    window.addEventListener('click', handleUserInteraction, { once: true })
+    window.addEventListener('keydown', handleUserInteraction, { once: true })
 
     // Atalho Global Ctrl+Shift+M para mutar microfone durante jogos em tela cheia com bip sonoro
     const unsubMute = window.msnApi.onGlobalMuteShortcut(() => {
@@ -1104,8 +1111,8 @@ const MainMsnMessengerWindow: React.FC = () => {
 
   return (
     <div className="h-screen w-screen msn-window-bg flex flex-col overflow-hidden select-none">
-      {/* ELEMENTO <audio id="remote-voice"> MUTADO NO DOM (MANTÉM STREAM WEBRTC ATIVO ENQUANTO O WEB AUDIO API REPRODUZ E CANCELA LOOPBACK) */}
-      <audio id="remote-voice" ref={remoteVoiceAudioRef} autoPlay playsInline muted />
+      {/* ELEMENTO <audio id="remote-voice"> REPRODUZ A VOZ DO AMIGO NATIVAMENTE */}
+      <audio id="remote-voice" ref={remoteVoiceAudioRef} autoPlay playsInline />
 
       {/* MODAL DE SELEÇÃO DE JANELA / TELA (desktopCapturer) */}
       <ScreenShareModal
