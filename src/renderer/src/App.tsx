@@ -145,6 +145,7 @@ const MainMsnMessengerWindow: React.FC = () => {
 
   // Estados de Sala Sempre Existente (Tela 3) e Compartilhamento de Tela Modo Cinema (Tela 4)
   const [inCall, setInCall] = useState<boolean>(false)
+  const [callHealth, setCallHealth] = useState<'connecting' | 'healthy' | 'degraded' | 'recovering' | 'dead'>('connecting')
   const [friendInRoom, setFriendInRoom] = useState<boolean>(false)
   const [roomViewActive, setRoomViewActive] = useState<boolean>(false)
   const [hasLocalCam, setHasLocalCam] = useState<boolean>(false)
@@ -660,6 +661,7 @@ const MainMsnMessengerWindow: React.FC = () => {
       },
       onCallStateChange: (state) => {
         setInCall(state.inCall)
+        setCallHealth(state.callHealth)
         setFriendInRoom(state.friendInRoom)
         setIsScreenSharing(state.isScreenSharing)
         setRemoteScreenSharing(state.remoteScreenSharing)
@@ -681,6 +683,31 @@ const MainMsnMessengerWindow: React.FC = () => {
           }
         }
         soundManager.stopRingLoop()
+      },
+      onCallDropped: (reason) => {
+        soundManager.play('room-leave')
+        setRoomViewActive(false)
+        setInCall(false)
+        setCallHealth('dead')
+        setIsScreenSharing(false)
+        setRemoteScreenSharing(false)
+        window.msnApi?.showNativeNotification?.(
+          'MSN Privado - Ligação Encerrada',
+          `A ligação caiu ou foi encerrada: ${reason}`
+        )
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `drop-${Date.now()}`,
+            sender: loggedInUser,
+            text: `⚠️ A ligação caiu (${reason}). Você saiu da sala de conferência.`,
+            isSystem: true,
+            timestamp: new Date().toLocaleTimeString('pt-BR', {
+              hour: '2-digit',
+              minute: '2-digit'
+            })
+          }
+        ])
       },
       onStreamsUpdated: (streams) => {
         streamsRef.current = streams
@@ -770,7 +797,13 @@ const MainMsnMessengerWindow: React.FC = () => {
       }
     })
 
+    const handleBeforeUnload = (): void => {
+      service.destroy()
+    }
+    window.addEventListener('beforeunload', handleBeforeUnload)
+
     return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload)
       unsubMute()
       unsubAlbumBroadcast()
       unsubQueueAlbum()
@@ -1573,6 +1606,18 @@ const MainMsnMessengerWindow: React.FC = () => {
               onMouseMove={handleCinemaMouseMove}
               className="relative w-full h-full bg-black overflow-hidden select-none cursor-default"
             >
+              {/* Alerta de Saúde da Conexão / Reconexão Automática P2P */}
+              {(callHealth === 'degraded' || callHealth === 'recovering') && (
+                <div className="absolute top-4 left-4 z-40 px-3 py-1.5 rounded-xl bg-amber-500/95 text-slate-950 text-xs font-bold flex items-center gap-2 shadow-2xl animate-pulse">
+                  <span className="w-2 h-2 rounded-full bg-red-600 animate-ping" />
+                  <span>
+                    {callHealth === 'recovering'
+                      ? '⚠️ Reconectando ligação P2P...'
+                      : '⚠️ Conexão instável (tentando restabelecer)...'}
+                  </span>
+                </div>
+              )}
+
               {/* Compartilhamento de Tela em Tela Cheia ao Fundo (Áudio gerenciado pelo remoteScreenAudioRef) */}
               <video
                 id="remote-screen"
@@ -1822,6 +1867,18 @@ const MainMsnMessengerWindow: React.FC = () => {
               onDoubleClick={handleToggleCallFullscreen}
               className="relative w-full h-full bg-slate-950 overflow-hidden flex items-center justify-center"
             >
+              {/* Alerta de Saúde da Conexão / Reconexão Automática P2P */}
+              {(callHealth === 'degraded' || callHealth === 'recovering') && (
+                <div className="absolute top-4 left-4 z-30 px-3 py-1.5 rounded-xl bg-amber-500/95 text-slate-950 text-xs font-bold flex items-center gap-2 shadow-2xl animate-pulse">
+                  <span className="w-2 h-2 rounded-full bg-red-600 animate-ping" />
+                  <span>
+                    {callHealth === 'recovering'
+                      ? '⚠️ Reconectando ligação P2P...'
+                      : '⚠️ Conexão instável (tentando restabelecer)...'}
+                  </span>
+                </div>
+              )}
+
               {/* Botões Rápidos no Canto Superior Direito (Ver Chat + Tela Cheia) */}
               <div className="absolute top-4 right-4 z-30 flex items-center gap-2">
                 <button
