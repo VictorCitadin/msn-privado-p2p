@@ -98,6 +98,11 @@ export type DataChannelPacket =
       screenStreamId: string | null
     }
   | {
+      type: 'room-state'
+      sender: MsnUser
+      inRoom: boolean
+    }
+  | {
       type: 'file-start'
       transferId: string
       sender: MsnUser
@@ -147,6 +152,7 @@ export interface WebRTCCallbacks {
   }) => void
   onCallStateChange: (state: {
     inCall: boolean
+    friendInRoom: boolean
     incomingCallFrom: MsnUser | null
     isScreenSharing: boolean
     remoteScreenSharing: boolean
@@ -208,6 +214,7 @@ export class MsnWebRTCService {
   private pendingIceCandidates: RTCIceCandidateInit[] = []
   private incomingCallFrom: MsnUser | null = null
   private inCall = false
+  private friendInRoom = false
   private friendLastStatus: PresenceStatus = 'offline'
   private myStatus: PresenceStatus = 'online'
   private mySubnick = 'Disponível no MSN Privado 🎮'
@@ -286,23 +293,43 @@ export class MsnWebRTCService {
         .on('presence', { event: 'sync' }, () => {
           const state = this.realtimeChannel?.presenceState() || {}
           const friendPresences = state[this.friendUser] as
-            | Array<{ status?: PresenceStatus; subnick?: string }>
+            | Array<{ status?: PresenceStatus; subnick?: string; inRoom?: boolean }>
             | undefined
 
           if (friendPresences && friendPresences.length > 0) {
             const latest = friendPresences[0]
             const newStatus: PresenceStatus = latest.status || 'online'
-            const newSubnick = latest.subnick || 'Online no MSN'
+            const newSubnick = latest.subnick || 'Online'
             const justLoggedIn = this.friendLastStatus === 'offline' && newStatus !== 'offline'
             this.friendLastStatus = newStatus
+            if (typeof latest.inRoom === 'boolean') {
+              this.friendInRoom = latest.inRoom
+              this.emitCallState()
+            }
             this.callbacks.onFriendPresenceChange(newStatus, newSubnick, justLoggedIn)
 
-            // Se a conexão de dados P2P ainda não estiver aberta e formos o Vitinho, inicia P2P silencioso para chat/arquivos
-            if (!this.peerConnection && this.myUser === 'Vitinho') {
+            if (this.inCall && (justLoggedIn || !this.peerConnection)) {
+              // Se estamos na Sala e o amigo acabou de abrir o app, envia nossa webcam ao vivo para o Chat dele!
+              setTimeout(() => {
+                if (this.inCall) {
+                  this.renegotiatePeerConnection().catch(() => {})
+                }
+              }, 350)
+            } else if (!this.inCall && latest.inRoom && !this.remoteCamStream) {
+              // Se o amigo já está na Sala e ainda não temos a webcam dele, pede sincronização da Sala
+              this.sendSignal('room-sync-request', {}).catch(() => {})
+            } else if (!this.peerConnection && this.myUser === 'Vitinho') {
+              // Inicia P2P silencioso para chat/arquivos
               this.connectDataChannelOnly().catch(() => {})
             }
           } else {
             this.friendLastStatus = 'offline'
+            this.friendInRoom = false
+            this.remoteVoiceStream = null
+            this.remoteCamStream = null
+            this.remoteScreenStream = null
+            this.emitStreamsUpdated()
+            this.emitCallState()
             this.callbacks.onFriendPresenceChange('offline', 'Offline', false)
           }
         })
@@ -316,6 +343,7 @@ export class MsnWebRTCService {
               user: this.myUser,
               status: this.myStatus,
               subnick: this.mySubnick,
+              inRoom: this.inCall,
               online_at: new Date().toISOString()
             })
           }
@@ -324,7 +352,13 @@ export class MsnWebRTCService {
   }
 
   private async sendSignal(
-    type: 'sdp-offer' | 'sdp-answer' | 'ice-candidate' | 'hangup' | 'renegotiate-offer',
+    type:
+      | 'sdp-offer'
+      | 'sdp-answer'
+      | 'ice-candidate'
+      | 'hangup'
+      | 'renegotiate-offer'
+      | 'room-sync-request',
     data: Record<string, unknown>
   ): Promise<void> {
     // 1. Envia instantaneamente via WebSocket do Supabase Realtime Broadcast
@@ -625,7 +659,7 @@ export class MsnWebRTCService {
       }
     }
 
-    // 2. Track da Webcam em MediaStream separado em 16:9 Widescreen HD (sem zoom/corte quadrado)
+    // 2. Track da Webcam em MediaStream separado em resolução natural full da câmera (sem corte quadrado)
     if (withVideo && !this.localCamStream) {
       try {
         const isCompact = this.ecoMode || Boolean(this.localScreenStream)
@@ -633,7 +667,6 @@ export class MsnWebRTCService {
           video: {
             width: { ideal: isCompact ? 640 : 1280 },
             height: { ideal: isCompact ? 360 : 720 },
-            aspectRatio: { ideal: 16 / 9 },
             frameRate: { ideal: isCompact ? 24 : 30 }
           },
           audio: false
@@ -645,6 +678,12 @@ export class MsnWebRTCService {
   }
 
   public async startCall(withVideo = true): Promise<void> {
+    this.inCall = true
+    this.incomingCallFrom = null
+    this.pendingOffer = null
+    this.setRemoteVoiceBoostVolume(this.remoteVoiceVolumePercent)
+    this.emitCallState()
+
     await this.acquireMicAndCam(withVideo)
     const pc = this.ensurePeerConnection()
 
@@ -654,9 +693,10 @@ export class MsnWebRTCService {
     }
 
     this.attachLocalStreamsToPeer(pc)
-    this.inCall = true
+    await this.ensureTransceiversSendRecv(pc)
     this.emitStreamsUpdated()
     this.emitCallState()
+    this.trackPresenceState()
 
     const offer = await pc.createOffer({
       offerToReceiveAudio: true,
@@ -665,57 +705,21 @@ export class MsnWebRTCService {
     await this.setLocalDescriptionSafe(pc, offer)
 
     this.broadcastStreamMeta()
+    this.sendDataChannelPacket({
+      type: 'room-state',
+      sender: this.myUser,
+      inRoom: true
+    })
     await this.sendSignal('sdp-offer', {
       sdp: pc.localDescription,
       isMediaCall: true,
+      inRoom: true,
       streamIds: this.getLocalStreamIds()
     })
   }
 
   public async acceptIncomingCall(): Promise<void> {
-    if (!this.pendingOffer) return
-    const offerToAccept = this.pendingOffer
-    this.pendingOffer = null
-    this.incomingCallFrom = null
-    this.inCall = true
-    this.emitCallState()
-
-    await this.acquireMicAndCam(true)
-    const pc = this.ensurePeerConnection()
-
-    try {
-      // 1. Anexa as tracks locais ANTES do setRemoteDescription para o WebRTC associar como sendrecv
-      this.attachLocalStreamsToPeer(pc)
-
-      // 2. Aplica a oferta remota do amigo e descarrega candidatos ICE pendentes
-      await pc.setRemoteDescription(new RTCSessionDescription(offerToAccept))
-      await this.flushPendingIceCandidates(pc)
-
-      // 3. Garante que todas as tracks locais (mic e câmera) estejam vinculadas em modo sendrecv nos transceivers ativos
-      await this.ensureTransceiversSendRecv(pc)
-
-      // 4. Cria e envia o SDP Answer
-      const answer = await pc.createAnswer()
-      await this.setLocalDescriptionSafe(pc, answer)
-
-      this.broadcastStreamMeta()
-      await this.sendSignal('sdp-answer', {
-        sdp: pc.localDescription,
-        streamIds: this.getLocalStreamIds()
-      })
-
-      // 5. Dispara renegociação complementar após 600ms para garantir que ambas as pontas recebam 100% das tracks
-      setTimeout(() => {
-        if (this.inCall && this.peerConnection?.signalingState === 'stable') {
-          this.renegotiatePeerConnection().catch(() => {})
-        }
-      }, 600)
-    } catch (err) {
-      console.error('[WebRTC] Erro ao aceitar chamada:', err)
-    }
-
-    this.emitStreamsUpdated()
-    this.emitCallState()
+    await this.startCall(true)
   }
 
   private async ensureTransceiversSendRecv(pc: RTCPeerConnection): Promise<void> {
@@ -755,11 +759,18 @@ export class MsnWebRTCService {
   }
 
   public rejectOrHangupCall(): void {
-    this.sendSignal('hangup', {})
-    this.cleanupMediaStreams()
+    this.inCall = false
     this.pendingOffer = null
     this.incomingCallFrom = null
-    this.inCall = false
+    this.setRemoteVoiceBoostVolume(this.remoteVoiceVolumePercent)
+    this.cleanupLocalMediaStreams()
+    this.trackPresenceState()
+    this.sendDataChannelPacket({
+      type: 'room-state',
+      sender: this.myUser,
+      inRoom: false
+    })
+    this.sendSignal('hangup', { inRoom: false })
     this.emitStreamsUpdated()
     this.emitCallState()
   }
@@ -891,7 +902,6 @@ export class MsnWebRTCService {
       await camTrack.applyConstraints({
         width: { ideal: compactMode ? 640 : 1280 },
         height: { ideal: compactMode ? 360 : 720 },
-        aspectRatio: { ideal: 16 / 9 },
         frameRate: { ideal: compactMode ? 24 : 30 }
       })
     } catch (err) {
@@ -940,10 +950,14 @@ export class MsnWebRTCService {
   private async renegotiatePeerConnection(): Promise<void> {
     if (!this.peerConnection) return
     this.broadcastStreamMeta()
-    const offer = await this.peerConnection.createOffer()
+    const offer = await this.peerConnection.createOffer({
+      offerToReceiveAudio: true,
+      offerToReceiveVideo: true
+    })
     await this.setLocalDescriptionSafe(this.peerConnection, offer)
     await this.sendSignal('renegotiate-offer', {
       sdp: this.peerConnection.localDescription,
+      inRoom: this.inCall,
       streamIds: this.getLocalStreamIds()
     })
   }
@@ -970,10 +984,10 @@ export class MsnWebRTCService {
   }
 
   // ==========================================================================
-  // 6. HANDLER DE SINAIS WEBRTC RECEBIDOS
+  // 6. HANDLER DE SINAIS WEBRTC RECEBIDOS (SALA SEMPRE EXISTENTE SEM ATENDER)
   // ==========================================================================
   private async handleIncomingSignal(
-    sender: MsnUser,
+    _sender: MsnUser,
     type: string,
     data: Record<string, unknown>
   ): Promise<void> {
@@ -985,56 +999,56 @@ export class MsnWebRTCService {
       }
     }
 
-    if (type === 'sdp-offer') {
-      const sdp = data.sdp as RTCSessionDescriptionInit
-      const isMediaCall = Boolean(data.isMediaCall)
-
-      if (!isMediaCall && !this.inCall) {
-        // Conexão automática do DataChannel P2P para chat de latência zero
-        const pc = this.ensurePeerConnection()
-        await pc.setRemoteDescription(new RTCSessionDescription(sdp))
-        await this.flushPendingIceCandidates(pc)
-        const answer = await pc.createAnswer()
-        await this.setLocalDescriptionSafe(pc, answer)
-        await this.sendSignal('sdp-answer', {
-          sdp: pc.localDescription,
-          streamIds: this.getLocalStreamIds()
-        })
-        return
-      }
-
-      // Se já estamos em chamada, aceita renegociação automaticamente
-      if (this.inCall) {
-        const pc = this.ensurePeerConnection()
-        await pc.setRemoteDescription(new RTCSessionDescription(sdp))
-        await this.flushPendingIceCandidates(pc)
-        const answer = await pc.createAnswer()
-        await this.setLocalDescriptionSafe(pc, answer)
-        await this.sendSignal('sdp-answer', {
-          sdp: pc.localDescription,
-          streamIds: this.getLocalStreamIds()
-        })
-        return
-      }
-
-      // Nova ligação recebida do amigo
-      this.pendingOffer = sdp
-      this.incomingCallFrom = sender
+    if (typeof data.inRoom === 'boolean') {
+      this.friendInRoom = data.inRoom
       this.emitCallState()
+    }
+
+    if (type === 'room-sync-request') {
+      if (this.inCall) {
+        this.renegotiatePeerConnection().catch(() => {})
+      }
       return
     }
 
-    if (type === 'renegotiate-offer') {
+    if (type === 'sdp-offer' || type === 'renegotiate-offer') {
       const sdp = data.sdp as RTCSessionDescriptionInit
+      const isMediaCall = Boolean(data.isMediaCall) || type === 'renegotiate-offer'
+
+      if (isMediaCall && data.inRoom === undefined) {
+        this.friendInRoom = true
+      }
+
+      // Na Sala Sempre Existente: aceita automaticamente a oferta WebRTC!
+      // Se ainda não entramos na Sala (!this.inCall), recebemos a webcam do amigo no quadrado do Chat (com voz silenciada até entrarmos).
+      // Se já estamos na Sala (this.inCall), anexamos nossas tracks locais em sendrecv e conversamos imediatamente!
       const pc = this.ensurePeerConnection()
+      if (this.inCall) {
+        this.attachLocalStreamsToPeer(pc)
+      }
       await pc.setRemoteDescription(new RTCSessionDescription(sdp))
       await this.flushPendingIceCandidates(pc)
+      if (this.inCall) {
+        await this.ensureTransceiversSendRecv(pc)
+      }
       const answer = await pc.createAnswer()
       await this.setLocalDescriptionSafe(pc, answer)
+      this.broadcastStreamMeta()
       await this.sendSignal('sdp-answer', {
         sdp: pc.localDescription,
+        inRoom: this.inCall,
         streamIds: this.getLocalStreamIds()
       })
+      this.emitStreamsUpdated()
+      this.emitCallState()
+
+      if (this.inCall && type === 'sdp-offer') {
+        setTimeout(() => {
+          if (this.inCall && this.peerConnection?.signalingState === 'stable') {
+            this.renegotiatePeerConnection().catch(() => {})
+          }
+        }, 500)
+      }
       return
     }
 
@@ -1059,10 +1073,11 @@ export class MsnWebRTCService {
     }
 
     if (type === 'hangup') {
-      this.cleanupMediaStreams()
-      this.pendingOffer = null
-      this.incomingCallFrom = null
-      this.inCall = false
+      // O amigo saiu da Sala: limpamos apenas as streams remotas dele, mantendo nossa própria estadia na Sala se estivermos nela!
+      this.friendInRoom = false
+      this.remoteVoiceStream = null
+      this.remoteCamStream = null
+      this.remoteScreenStream = null
       this.emitStreamsUpdated()
       this.emitCallState()
     }
@@ -1390,7 +1405,9 @@ export class MsnWebRTCService {
       const analyser = ctx.createAnalyser()
       analyser.fftSize = 256
       const gainNode = ctx.createGain()
-      const gainValue = Math.max(0, Math.min(2, this.remoteVoiceVolumePercent / 100))
+      const gainValue = this.inCall
+        ? Math.max(0, Math.min(2, this.remoteVoiceVolumePercent / 100))
+        : 0
       gainNode.gain.value = gainValue
 
       // O <audio id="remote-voice"> fica com muted=true no DOM (apenas para manter o receptor WebRTC ativo no Chromium),
@@ -1421,7 +1438,9 @@ export class MsnWebRTCService {
   public setRemoteVoiceBoostVolume(volumePercent: number): void {
     this.remoteVoiceVolumePercent = volumePercent
     if (!this.remoteVoiceGainNode || !this.audioCtx) return
-    const gainValue = Math.max(0, Math.min(2, volumePercent / 100))
+    const gainValue = this.inCall
+      ? Math.max(0, Math.min(2, volumePercent / 100))
+      : 0
     this.remoteVoiceGainNode.gain.setTargetAtTime(gainValue, this.audioCtx.currentTime, 0.02)
   }
 
@@ -1499,6 +1518,11 @@ export class MsnWebRTCService {
     channel.onopen = () => {
       this.broadcastStreamMeta()
       this.sendSubnickAndStatus(this.mySubnick, this.myStatus)
+      this.sendDataChannelPacket({
+        type: 'room-state',
+        sender: this.myUser,
+        inRoom: this.inCall
+      })
     }
 
     channel.onmessage = (event) => {
@@ -1574,6 +1598,17 @@ export class MsnWebRTCService {
           camStreamId: packet.camStreamId,
           screenStreamId: packet.screenStreamId
         }
+        break
+
+      case 'room-state':
+        this.friendInRoom = packet.inRoom
+        if (!packet.inRoom) {
+          this.remoteVoiceStream = null
+          this.remoteCamStream = null
+          this.remoteScreenStream = null
+          this.emitStreamsUpdated()
+        }
+        this.emitCallState()
         break
 
       case 'file-start':
@@ -1771,6 +1806,20 @@ export class MsnWebRTCService {
     })
   }
 
+  private trackPresenceState(): void {
+    if (this.realtimeChannel) {
+      this.realtimeChannel
+        .track({
+          user: this.myUser,
+          status: this.myStatus,
+          subnick: this.mySubnick,
+          inRoom: this.inCall,
+          online_at: new Date().toISOString()
+        })
+        .catch(() => {})
+    }
+  }
+
   public sendSubnickAndStatus(subnick: string, status: PresenceStatus): void {
     this.mySubnick = subnick
     this.myStatus = status
@@ -1782,16 +1831,7 @@ export class MsnWebRTCService {
       status
     })
 
-    if (this.realtimeChannel) {
-      this.realtimeChannel
-        .track({
-          user: this.myUser,
-          status: this.myStatus,
-          subnick: this.mySubnick,
-          online_at: new Date().toISOString()
-        })
-        .catch(() => {})
-    }
+    this.trackPresenceState()
   }
 
   public sendDjSync(state: DjSyncState): void {
@@ -1817,7 +1857,7 @@ export class MsnWebRTCService {
   // ==========================================================================
   // 9. LIMPEZA DE RECURSOS E EMISSÃO DE ESTADO
   // ==========================================================================
-  private cleanupMediaStreams(): void {
+  private cleanupLocalMediaStreams(): void {
     if (this.peerConnection) {
       for (const sender of this.peerConnection.getSenders()) {
         if (sender.track) {
@@ -1837,6 +1877,10 @@ export class MsnWebRTCService {
     this.localMicStream = null
     this.localCamStream = null
     this.localScreenStream = null
+  }
+
+  private cleanupMediaStreams(): void {
+    this.cleanupLocalMediaStreams()
     this.remoteVoiceStream = null
     this.remoteCamStream = null
     this.remoteScreenStream = null
@@ -1853,8 +1897,13 @@ export class MsnWebRTCService {
   }
 
   private emitCallState(): void {
+    const hasRemoteCamOrVoice = Boolean(
+      (this.remoteCamStream && this.remoteCamStream.getVideoTracks().some((t) => t.readyState === 'live')) ||
+        (this.remoteVoiceStream && this.remoteVoiceStream.getAudioTracks().some((t) => t.readyState === 'live'))
+    )
     this.callbacks.onCallStateChange({
       inCall: this.inCall,
+      friendInRoom: this.friendInRoom || hasRemoteCamOrVoice,
       incomingCallFrom: this.incomingCallFrom,
       isScreenSharing: Boolean(this.localScreenStream),
       remoteScreenSharing: Boolean(

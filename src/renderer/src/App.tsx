@@ -11,7 +11,6 @@ import {
   Mic,
   MicOff,
   PhoneOff,
-  PhoneCall,
   Send,
   Paperclip,
   Volume2,
@@ -132,9 +131,12 @@ const MainMsnMessengerWindow: React.FC = () => {
   } | null>(null)
   const [isDraggingOverChat, setIsDraggingOverChat] = useState<boolean>(false)
 
-  // Estados de Chamada de Vídeo (Tela 3) e Compartilhamento de Tela Modo Cinema (Tela 4)
+  // Estados de Sala Sempre Existente (Tela 3) e Compartilhamento de Tela Modo Cinema (Tela 4)
   const [inCall, setInCall] = useState<boolean>(false)
-  const [incomingCallFrom, setIncomingCallFrom] = useState<MsnUser | null>(null)
+  const [friendInRoom, setFriendInRoom] = useState<boolean>(false)
+  const [roomViewActive, setRoomViewActive] = useState<boolean>(false)
+  const [hasLocalCam, setHasLocalCam] = useState<boolean>(false)
+  const [hasRemoteCam, setHasRemoteCam] = useState<boolean>(false)
   const [isScreenSharing, setIsScreenSharing] = useState<boolean>(false)
   const [remoteScreenSharing, setRemoteScreenSharing] = useState<boolean>(false)
   const [screenModalOpen, setScreenModalOpen] = useState<boolean>(false)
@@ -160,7 +162,7 @@ const MainMsnMessengerWindow: React.FC = () => {
     y: 16
   })
   const [friendCornerCamPos, setFriendCornerCamPos] = useState<{ x: number; y: number }>({
-    x: 200,
+    x: 252,
     y: 16
   })
   const draggingCamRef = useRef<{
@@ -299,11 +301,41 @@ const MainMsnMessengerWindow: React.FC = () => {
     }
   }, [isWindowVisible])
 
+  const bindLocalCamRef = useCallback(
+    (el: HTMLVideoElement | null) => {
+      localCamVideoRef.current = el
+      if (el && isWindowVisible && streamsRef.current.localCam) {
+        if (el.srcObject !== streamsRef.current.localCam) {
+          el.srcObject = streamsRef.current.localCam
+          el.play().catch(() => {})
+        }
+      }
+    },
+    [isWindowVisible]
+  )
+
+  const bindRemoteCamRef = useCallback(
+    (el: HTMLVideoElement | null) => {
+      remoteCamVideoRef.current = el
+      if (el && isWindowVisible && streamsRef.current.remoteCam) {
+        if (el.srcObject !== streamsRef.current.remoteCam) {
+          el.srcObject = streamsRef.current.remoteCam
+          el.play().catch(() => {})
+        }
+      }
+    },
+    [isWindowVisible]
+  )
+
   useEffect(() => {
     syncMediaElementsWithVisibility()
   }, [
     isWindowVisible,
     inCall,
+    friendInRoom,
+    roomViewActive,
+    hasLocalCam,
+    hasRemoteCam,
     isScreenSharing,
     remoteScreenSharing,
     syncMediaElementsWithVisibility
@@ -363,7 +395,7 @@ const MainMsnMessengerWindow: React.FC = () => {
         if (justLoggedIn) {
           soundManager.play('login')
           window.msnApi.showNativeNotification(
-            'MSN Messenger Privado',
+            'Vitinho e Will',
             `${loggedInUser === 'Vitinho' ? 'Will' : 'Vitinho'} acabou de entrar!`
           )
         }
@@ -436,18 +468,18 @@ const MainMsnMessengerWindow: React.FC = () => {
       },
       onCallStateChange: (state) => {
         setInCall(state.inCall)
-        setIncomingCallFrom(state.incomingCallFrom)
+        setFriendInRoom(state.friendInRoom)
         setIsScreenSharing(state.isScreenSharing)
         setRemoteScreenSharing(state.remoteScreenSharing)
-
-        if (state.incomingCallFrom) {
-          soundManager.startRingLoop()
-        } else {
-          soundManager.stopRingLoop()
+        if (!state.inCall) {
+          setRoomViewActive(false)
         }
+        soundManager.stopRingLoop()
       },
       onStreamsUpdated: (streams) => {
         streamsRef.current = streams
+        setHasLocalCam(Boolean(streams.localCam && streams.localCam.getVideoTracks().length > 0))
+        setHasRemoteCam(Boolean(streams.remoteCam && streams.remoteCam.getVideoTracks().length > 0))
         syncMediaElementsWithVisibility()
       },
       onVoiceActivityChange: (speaking) => {
@@ -750,7 +782,7 @@ const MainMsnMessengerWindow: React.FC = () => {
   if (!loggedInUser) {
     return (
       <div className="h-screen w-screen msn-window-bg flex flex-col justify-between p-6 select-none">
-        {/* Topo Estilo Windows Live Messenger */}
+        {/* Topo Estilo Anos 2000 — Vitinho e Will */}
         <div className="flex items-center justify-between border-b border-[#8ab0d8] pb-3">
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-[#4facfe] to-[#00f2fe] border border-[#1d528d] flex items-center justify-center shadow">
@@ -758,10 +790,10 @@ const MainMsnMessengerWindow: React.FC = () => {
             </div>
             <div>
               <h1 className="text-sm font-extrabold text-[#164273]">
-                Windows Live Messenger 2009 — Gaming Edition
+                Vitinho e Will
               </h1>
               <p className="text-[11px] text-slate-600">
-                Comunicação P2P Privada &amp; Exclusiva: Vitinho &amp; Will
+                Comunicação P2P Privada &amp; Exclusiva
               </p>
             </div>
           </div>
@@ -775,7 +807,7 @@ const MainMsnMessengerWindow: React.FC = () => {
         <div className="max-w-md w-full mx-auto bg-white/85 backdrop-blur-xs rounded-2xl border-2 border-[#7da2ce] shadow-xl p-6 space-y-5">
           <div className="text-center space-y-1">
             <h2 className="text-base font-extrabold text-[#164273]">
-              Entrar no MSN Messenger
+              Vitinho e Will
             </h2>
             <p className="text-xs text-slate-600">
               Selecione seu perfil abaixo e digite seu PIN de 4 dígitos
@@ -861,7 +893,7 @@ const MainMsnMessengerWindow: React.FC = () => {
               type="submit"
               className="w-full py-2.5 rounded-xl bg-gradient-to-b from-[#4b91d1] via-[#2664a5] to-[#1d528d] hover:brightness-110 text-white font-extrabold text-xs shadow-md border border-[#143d6b]"
             >
-              Entrar no Messenger ({selectedLoginUser})
+              Entrar ({selectedLoginUser})
             </button>
           </form>
         </div>
@@ -917,7 +949,7 @@ const MainMsnMessengerWindow: React.FC = () => {
     )
   }
 
-  const isCinemaScreenMode = inCall && (isScreenSharing || remoteScreenSharing)
+  const isCinemaScreenMode = inCall && roomViewActive && (isScreenSharing || remoteScreenSharing)
   const myAvatar = loggedInUser === 'Vitinho' ? AVATAR_VITINHO : AVATAR_WILL
   const friendAvatar = friendUser === 'Vitinho' ? AVATAR_VITINHO : AVATAR_WILL
 
@@ -1013,38 +1045,56 @@ const MainMsnMessengerWindow: React.FC = () => {
       )}
 
       {/* ==================================================================== */}
-      {/* BARRA DE TOPO: OS 7 BOTÕES GRANDES ESTILO MSN (OCULTADA EM TELA CHEIA) */}
+      {/* BARRA DE TOPO: OS BOTÕES GRANDES ESTILO MSN (OCULTADA EM TELA CHEIA) */}
       {/* ==================================================================== */}
       {!(inCall && isCallFullscreen) && (
         <nav className="msn-toolbar-gradient px-3 py-1.5 flex flex-wrap items-center justify-between gap-1.5 shrink-0">
         <div className="flex flex-wrap items-center gap-1.5">
-          {/* 1. Ligar Vídeo */}
+          {/* 1. Entrar na Sala / Sair da Sala (Sala Sempre Existente) */}
           <button
             type="button"
             onClick={() => {
               if (inCall) {
+                setRoomViewActive(false)
                 webrtcRef.current?.rejectOrHangupCall()
               } else {
-                soundManager.play('ring')
+                setRoomViewActive(true)
                 webrtcRef.current?.startCall(true)
               }
             }}
             className={`msn-btn-aero px-2.5 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 ${
-              inCall ? 'text-red-700 border-red-400' : 'text-[#164273]'
+              inCall
+                ? 'text-red-700 border-red-400'
+                : friendInRoom
+                  ? 'ring-2 ring-[#52b700] text-[#285e00]'
+                  : 'text-[#164273]'
             }`}
           >
             {inCall ? (
               <>
                 <PhoneOff className="w-4 h-4 text-red-600" />
-                <span>Encerrar Ligação</span>
+                <span>Sair da Sala</span>
               </>
             ) : (
               <>
                 <Video className="w-4 h-4 text-[#2664a5]" />
-                <span>Ligar Vídeo</span>
+                <span>
+                  {friendInRoom ? `Entrar na Sala (${friendUser} está lá!)` : 'Entrar na Sala'}
+                </span>
               </>
             )}
           </button>
+
+          {/* Alternar entre Ver Sala e Ver Chat enquanto estiver dentro da Sala */}
+          {inCall && (
+            <button
+              type="button"
+              onClick={() => setRoomViewActive((prev) => !prev)}
+              className="msn-btn-aero px-2.5 py-1.5 rounded-lg text-xs font-bold text-[#164273] flex items-center gap-1.5 ring-1 ring-[#2664a5]"
+            >
+              <span>{roomViewActive ? '💬 Ver Chat' : '📹 Voltar para a Sala'}</span>
+            </button>
+          )}
 
           {/* 2. Compartilhar Tela */}
           <button
@@ -1053,6 +1103,7 @@ const MainMsnMessengerWindow: React.FC = () => {
               if (isScreenSharing) {
                 webrtcRef.current?.stopScreenShare()
               } else {
+                setRoomViewActive(true)
                 setScreenModalOpen(true)
               }
             }}
@@ -1162,29 +1213,26 @@ const MainMsnMessengerWindow: React.FC = () => {
         </div>
       )}
 
-      {/* ALERTA DE LIGAÇÃO RECEBIDA */}
-      {incomingCallFrom && !inCall && (
-        <div className="bg-gradient-to-r from-[#2664a5] to-[#52b700] text-white px-4 py-2 flex items-center justify-between shadow-md">
+      {/* BANNER DISCRETO QUANDO O AMIGO ESTÁ NA SALA (SEM PRECISAR ATENDER) */}
+      {friendInRoom && !inCall && (
+        <div className="bg-gradient-to-r from-[#1d528d] to-[#3a8d00] text-white px-4 py-1.5 flex items-center justify-between shadow-md shrink-0">
           <div className="flex items-center gap-2 text-xs font-bold">
-            <PhoneCall className="w-4 h-4 animate-bounce" />
-            <span>{incomingCallFrom} está te ligando por vídeo no MSN!</span>
+            <span className="w-2.5 h-2.5 rounded-full bg-[#76ff03] animate-ping" />
+            <span>
+              🟢 {friendUser} está na Sala agora! A câmera dele aparece ali no quadrado do chat — entre quando quiser!
+            </span>
           </div>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => webrtcRef.current?.acceptIncomingCall()}
-              className="px-3 py-1 rounded bg-white text-emerald-800 text-xs font-extrabold shadow"
-            >
-              Atender Vídeo
-            </button>
-            <button
-              type="button"
-              onClick={() => webrtcRef.current?.rejectOrHangupCall()}
-              className="px-3 py-1 rounded bg-red-600 text-white text-xs font-bold"
-            >
-              Recusar
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setRoomViewActive(true)
+              webrtcRef.current?.startCall(true)
+            }}
+            className="px-3 py-1 rounded-lg bg-white text-emerald-900 hover:bg-emerald-50 text-xs font-extrabold shadow flex items-center gap-1.5"
+          >
+            <Video className="w-3.5 h-3.5 text-emerald-700" />
+            <span>Entrar na Sala</span>
+          </button>
         </div>
       )}
 
@@ -1229,40 +1277,40 @@ const MainMsnMessengerWindow: React.FC = () => {
                 </div>
               ))}
 
-              {/* Câmera 1 no Canto Superior (Arrastável / Draggable): Minha Câmera (aspect-square w-36 h-36 rounded-2xl) */}
+              {/* Câmera 1 no Canto Superior (Arrastável / Draggable): Minha Câmera Full Widescreen (sem corte quadrado) */}
               <div
                 onMouseDown={(e) => startDraggingCornerCam('my', e)}
                 onClick={(e) => e.stopPropagation()}
                 style={{ left: myCornerCamPos.x, top: myCornerCamPos.y }}
-                className="absolute z-20 aspect-square w-36 h-36 rounded-2xl overflow-hidden border-2 border-[#4facfe] bg-slate-900 shadow-2xl cursor-move"
+                className="absolute z-20 w-56 aspect-video rounded-xl overflow-hidden border-2 border-[#4facfe] bg-black shadow-2xl cursor-move"
                 title="Arraste para mover sua câmera para qualquer canto"
               >
                 <video
-                  ref={localCamVideoRef}
+                  ref={bindLocalCamRef}
                   autoPlay
                   playsInline
                   muted
-                  className="w-full h-full object-cover"
+                  className="w-full h-full object-contain bg-black"
                 />
                 <span className="absolute bottom-1.5 left-2 px-1.5 py-0.5 rounded bg-black/70 text-white text-[10px] font-bold">
                   {loggedInUser} (Você)
                 </span>
               </div>
 
-              {/* Câmera 2 no Canto Superior (Arrastável / Draggable): Câmera do Amigo (aspect-square w-36 h-36 rounded-2xl) */}
+              {/* Câmera 2 no Canto Superior (Arrastável / Draggable): Câmera do Amigo Full Widescreen (sem corte quadrado) */}
               <div
                 onMouseDown={(e) => startDraggingCornerCam('friend', e)}
                 onClick={(e) => e.stopPropagation()}
                 style={{ left: friendCornerCamPos.x, top: friendCornerCamPos.y }}
-                className="absolute z-20 aspect-square w-36 h-36 rounded-2xl overflow-hidden border-2 border-[#52b700] bg-slate-900 shadow-2xl cursor-move"
+                className="absolute z-20 w-56 aspect-video rounded-xl overflow-hidden border-2 border-[#52b700] bg-black shadow-2xl cursor-move"
                 title={`Arraste para mover a câmera de ${friendUser}`}
               >
                 <video
-                  ref={remoteCamVideoRef}
+                  ref={bindRemoteCamRef}
                   autoPlay
                   playsInline
                   muted
-                  className="w-full h-full object-cover"
+                  className="w-full h-full object-contain bg-black"
                 />
                 <span className="absolute bottom-1.5 left-2 px-1.5 py-0.5 rounded bg-black/70 text-white text-[10px] font-bold">
                   {friendUser}
@@ -1420,63 +1468,97 @@ const MainMsnMessengerWindow: React.FC = () => {
 
                   <button
                     type="button"
-                    onClick={() => webrtcRef.current?.rejectOrHangupCall()}
+                    onClick={() => {
+                      setRoomViewActive(false)
+                      webrtcRef.current?.rejectOrHangupCall()
+                    }}
                     className="px-3.5 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold flex items-center gap-1.5"
                   >
                     <PhoneOff className="w-4 h-4" />
-                    <span>Desligar</span>
+                    <span>Sair da Sala</span>
                   </button>
                 </div>
               </div>
             </div>
-          ) : inCall ? (
+          ) : inCall && roomViewActive ? (
             /* ================================================================ */
-            /* TELA 3: LIGAÇÃO DE VÍDEO (1x1)                                   */
+            /* TELA 3: SALA DE VÍDEO (1x1) — WEBCAMS SEMPRE EM IMAGEM FULL      */
             /* ================================================================ */
             <div
               onDoubleClick={handleToggleCallFullscreen}
               className="relative w-full h-full bg-slate-950 overflow-hidden flex items-center justify-center"
             >
-              {/* Botão Rápido de Tela Cheia no Canto Superior Direito */}
-              <button
-                type="button"
-                onClick={handleToggleCallFullscreen}
-                className="absolute top-4 right-4 z-30 px-3 py-1.5 rounded-xl bg-slate-900/80 hover:bg-slate-800 border border-slate-600 text-white text-xs font-bold flex items-center gap-1.5 shadow-lg"
-                title="Alternar Tela Cheia (F11 ou Duplo Clique)"
-              >
-                {isCallFullscreen ? (
-                  <>
-                    <Minimize2 className="w-3.5 h-3.5 text-sky-300" />
-                    <span>Sair da Tela Cheia</span>
-                  </>
-                ) : (
-                  <>
-                    <Maximize2 className="w-3.5 h-3.5 text-sky-400" />
-                    <span>Tela Cheia</span>
-                  </>
-                )}
-              </button>
+              {/* Botões Rápidos no Canto Superior Direito (Ver Chat + Tela Cheia) */}
+              <div className="absolute top-4 right-4 z-30 flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setRoomViewActive(false)}
+                  className="px-3 py-1.5 rounded-xl bg-slate-900/80 hover:bg-slate-800 border border-slate-600 text-white text-xs font-bold flex items-center gap-1.5 shadow-lg"
+                >
+                  <span>💬 Ver Chat</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleToggleCallFullscreen}
+                  className="px-3 py-1.5 rounded-xl bg-slate-900/80 hover:bg-slate-800 border border-slate-600 text-white text-xs font-bold flex items-center gap-1.5 shadow-lg"
+                  title="Alternar Tela Cheia (F11 ou Duplo Clique)"
+                >
+                  {isCallFullscreen ? (
+                    <>
+                      <Minimize2 className="w-3.5 h-3.5 text-sky-300" />
+                      <span>Sair da Tela Cheia</span>
+                    </>
+                  ) : (
+                    <>
+                      <Maximize2 className="w-3.5 h-3.5 text-sky-400" />
+                      <span>Tela Cheia</span>
+                    </>
+                  )}
+                </button>
+              </div>
 
-              {/* Câmera do Amigo em proporção natural 16:9 Widescreen sem zoom/corte (object-contain) */}
+              {/* Câmera do Amigo em proporção natural Full (object-contain) */}
               <video
-                ref={remoteCamVideoRef}
+                ref={bindRemoteCamRef}
                 autoPlay
                 playsInline
                 muted
                 className="w-full h-full object-contain bg-slate-950"
               />
 
-              {/* Minha Câmera flutuando no canto inferior direito: quadrada (aspect-square w-40 h-40) com cantos arredondados (rounded-2xl) */}
-              <div className="absolute bottom-20 right-5 z-20 aspect-square w-40 h-40 rounded-2xl overflow-hidden border-2 border-[#4facfe] bg-slate-900 shadow-2xl">
+              {/* Aviso quando você está na Sala aguardando o amigo entrar */}
+              {!friendInRoom && !hasRemoteCam && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none z-10 p-4 text-center">
+                  <div className="px-6 py-4 rounded-2xl bg-slate-900/85 border border-slate-700 shadow-2xl space-y-2 max-w-md pointer-events-auto">
+                    <div className="flex items-center justify-center gap-2 text-emerald-400 font-extrabold text-sm">
+                      <span className="w-2.5 h-2.5 rounded-full bg-[#76ff03] animate-ping" />
+                      <span>Você está na Sala!</span>
+                    </div>
+                    <p className="text-xs text-slate-300">
+                      Sua webcam já está aparecendo ao vivo no quadrado do chat para <strong>{friendUser}</strong>. Assim que ele clicar em <strong>Entrar na Sala</strong>, vocês já começam a conversar!
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setRoomViewActive(false)}
+                      className="mt-1 px-4 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold shadow"
+                    >
+                      💬 Ir para o Chat (Continuando na Sala)
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Minha Câmera flutuando no canto inferior direito: imagem FULL da webcam sem quadrado/corte */}
+              <div className="absolute bottom-20 right-5 z-20 w-64 aspect-video rounded-xl overflow-hidden border-2 border-[#4facfe] bg-black shadow-2xl">
                 <video
-                  ref={localCamVideoRef}
+                  ref={bindLocalCamRef}
                   autoPlay
                   playsInline
                   muted
-                  className="w-full h-full object-cover"
+                  className="w-full h-full object-contain bg-black"
                 />
                 <span className="absolute bottom-1.5 left-2 px-2 py-0.5 rounded bg-black/70 text-white text-[10px] font-bold">
-                  {loggedInUser}
+                  {loggedInUser} (Você)
                 </span>
               </div>
 
@@ -1579,11 +1661,14 @@ const MainMsnMessengerWindow: React.FC = () => {
 
                 <button
                   type="button"
-                  onClick={() => webrtcRef.current?.rejectOrHangupCall()}
+                  onClick={() => {
+                    setRoomViewActive(false)
+                    webrtcRef.current?.rejectOrHangupCall()
+                  }}
                   className="px-3.5 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold flex items-center gap-1.5"
                 >
                   <PhoneOff className="w-4 h-4" />
-                  <span>Desligar</span>
+                  <span>Sair da Sala</span>
                 </button>
               </div>
             </div>
@@ -1761,16 +1846,45 @@ const MainMsnMessengerWindow: React.FC = () => {
                 </form>
               </div>
 
-              {/* COLUNA DA DIREITA (AVATARES ESTILO MSN: SUPERIOR AMIGO / INFERIOR MINHA FOTO) */}
-              <div className="w-40 shrink-0 flex flex-col justify-between items-center py-1">
-                {/* Moldura Superior: Foto do Amigo */}
-                <div className="flex flex-col items-center gap-1.5">
-                  <div className="msn-avatar-frame p-2 rounded-2xl w-32 h-32 relative">
-                    <img
-                      src={friendAvatar}
-                      alt={friendUser}
-                      className="w-full h-full rounded-xl object-cover"
-                    />
+              {/* COLUNA DA DIREITA (MOLDURAS DO CHAT: MOSTRA A WEBCAM AO VIVO DE QUEM ESTIVER NA SALA!) */}
+              <div className="w-52 shrink-0 flex flex-col justify-between items-center py-1">
+                {/* Moldura Superior: Amigo (Mostra a Webcam Full ao vivo quando ele está na Sala!) */}
+                <div className="flex flex-col items-center gap-1.5 w-full">
+                  <div
+                    onClick={() => {
+                      if (friendInRoom && !inCall) {
+                        setRoomViewActive(true)
+                        webrtcRef.current?.startCall(true)
+                      } else if (inCall) {
+                        setRoomViewActive(true)
+                      }
+                    }}
+                    className={`msn-avatar-frame p-1.5 rounded-2xl relative overflow-hidden transition-all ${
+                      friendInRoom && hasRemoteCam
+                        ? 'w-48 aspect-video cursor-pointer ring-2 ring-[#52b700]'
+                        : 'w-36 h-36'
+                    }`}
+                    title={
+                      friendInRoom
+                        ? `${friendUser} está na Sala! Clique para entrar na Sala.`
+                        : friendUser
+                    }
+                  >
+                    {friendInRoom && hasRemoteCam ? (
+                      <video
+                        ref={bindRemoteCamRef}
+                        autoPlay
+                        playsInline
+                        muted
+                        className="w-full h-full rounded-xl object-contain bg-black"
+                      />
+                    ) : (
+                      <img
+                        src={friendAvatar}
+                        alt={friendUser}
+                        className="w-full h-full rounded-xl object-cover"
+                      />
+                    )}
                     <span
                       className={`absolute bottom-2.5 right-2.5 w-3.5 h-3.5 rounded-full border-2 border-white ${
                         friendStatus === 'online'
@@ -1780,23 +1894,64 @@ const MainMsnMessengerWindow: React.FC = () => {
                             : 'bg-[#8e99a4]'
                       }`}
                     />
+                    {friendInRoom && (
+                      <span className="absolute top-2 left-2 px-1.5 py-0.5 rounded bg-[#3a8d00]/90 text-white text-[9px] font-extrabold shadow">
+                        🟢 NA SALA
+                      </span>
+                    )}
                   </div>
                   <span className="text-xs font-extrabold text-[#164273]">{friendUser}</span>
+                  {friendInRoom && !inCall && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRoomViewActive(true)
+                        webrtcRef.current?.startCall(true)
+                      }}
+                      className="px-2.5 py-1 rounded-lg bg-[#52b700] hover:brightness-110 text-white text-[11px] font-extrabold shadow"
+                    >
+                      Entrar na Sala
+                    </button>
+                  )}
                 </div>
 
-                {/* Moldura Inferior: Minha Foto */}
-                <div className="flex flex-col items-center gap-1.5">
-                  <div className="msn-avatar-frame p-2 rounded-2xl w-32 h-32 relative">
-                    <img
-                      src={myAvatar}
-                      alt={loggedInUser}
-                      className="w-full h-full rounded-xl object-cover"
-                    />
+                {/* Moldura Inferior: Você (Mostra sua Webcam Full ao vivo quando você está na Sala!) */}
+                <div className="flex flex-col items-center gap-1.5 w-full">
+                  <div
+                    onClick={() => {
+                      if (inCall) setRoomViewActive(true)
+                    }}
+                    className={`msn-avatar-frame p-1.5 rounded-2xl relative overflow-hidden transition-all ${
+                      inCall && hasLocalCam
+                        ? 'w-48 aspect-video cursor-pointer ring-2 ring-[#4facfe]'
+                        : 'w-36 h-36'
+                    }`}
+                  >
+                    {inCall && hasLocalCam ? (
+                      <video
+                        ref={bindLocalCamRef}
+                        autoPlay
+                        playsInline
+                        muted
+                        className="w-full h-full rounded-xl object-contain bg-black"
+                      />
+                    ) : (
+                      <img
+                        src={myAvatar}
+                        alt={loggedInUser}
+                        className="w-full h-full rounded-xl object-cover"
+                      />
+                    )}
                     <span
                       className={`absolute bottom-2.5 right-2.5 w-3.5 h-3.5 rounded-full border-2 border-white ${
                         myStatus === 'online' ? 'bg-[#52b700]' : 'bg-[#d93025]'
                       }`}
                     />
+                    {inCall && (
+                      <span className="absolute top-2 left-2 px-1.5 py-0.5 rounded bg-[#1d528d]/90 text-white text-[9px] font-extrabold shadow">
+                        🟢 NA SALA
+                      </span>
+                    )}
                   </div>
                   <span className="text-xs font-extrabold text-[#164273]">
                     {loggedInUser} (Você)

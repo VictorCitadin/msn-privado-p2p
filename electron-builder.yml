@@ -1,5 +1,6 @@
 appId: com.vitinhowill.msnprivadop2p
-productName: MSN Messenger Privado (Vitinho & Will)
+productName: Vitinho e Will
+afterPack: build/afterPack.cjs
 directories:
   buildResources: build
   output: dist
@@ -15,6 +16,7 @@ files:
 asarUnpack:
   - resources/**
 win:
+  icon: build/icon.ico
   executableName: MSNMessengerPrivado
   signAndEditExecutable: false
   target:

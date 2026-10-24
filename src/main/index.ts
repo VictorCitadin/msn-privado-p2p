@@ -13,6 +13,7 @@ import {
 } from 'electron'
 import { join, extname } from 'path'
 import { createServer, Server as HttpServer } from 'http'
+import { existsSync } from 'fs'
 import { readFile } from 'fs/promises'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { autoUpdater } from 'electron-updater'
@@ -207,35 +208,35 @@ async function supabaseRestFetch<T>(
 }
 
 // ============================================================================
-// 3. ÍCONE NATIVO DO MSN EM DATA URL (ZERO ARQUIVO EXTERNO OBRIGATÓRIO)
+// 3. ÍCONE ANOS 2000 NATIVO EM PNG/ICO (BARRA DE TAREFAS + BANDEJA DO SISTEMA)
 // ============================================================================
+const MSN_2000S_ICON_PNG64 =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAcZklEQVR42u3bB1BU594/8DczxmyixrSbm3tjr0k0JmoUE280iYnGJGo0KhoLRUWlWYBdLAjYQZaigBRBeu+9Lh12l7677LK7lKV3ll6N3//7nEVAxYiJ78z/nXnPzGdgxsGZ7/c8e/Y5v7P7X//1f8eLHwxWzysXUnumGKX10BS6aUapj3QppBCdCiyiY0yy/HFJ7aMuJrXRLiY+0kq7mPBIi0I80Twmrol2LqZxikFkwyv/o6HXucmnXM3um2WZ27/ermhA2Yk3oHWPP0C/xx9gPK6fcY/3pD6F4if1jil6pIfhPF4h0T2xgi6C7pjXqWXL6VBmZrStv5zUPGsNUzzlpQbfG9a1zL5oQM1NOGjnIxli+UmHxH7SoUY/yVC7r2RIrjA4RjyRgceVjtc/MdEjfX+it91X1NvoK+oVe5f0su4Xd9vZceRqv7lVLvvilvDvFbHVr+N97cQeZXfRkJuvZEjsLR4acC0ZxN2iftjk98EytxeW3DFMTs8TusFkj9elkPNI55hsouNxWYT8cZntoyyon22wzm6HPbcDLoVd8BL0DPiU9IjdirvcNEPrlH+wl7z/l8LvCu5caJjeS/cWD7G9SocG7vH6YMPtwLV0OS4ktYEe1wK9mGacjSaaFKKIRoXIhjER9ZQzEXU4E14PzbBGaIQ0QiOYaFAIIuoVAuvGBNSOqIGGfw2OUapxzI+ogoZfFU4GVONUSA3OR9fjRkoL7nLl8OR3D3gJutn0mAb6dmfpwhcM37HwYmavibd4SOwp7IM/W4jIhHDERLojPMwNYaH3ERpCuD4ueDwXhaBH7lGCg1zgFBQJeqAAyp412ONOVGOPG1GlcF+G3ZRK7HYlKrDbhShXuEeUYbczIR0hwT4XKdS9KqAXVgOz1GbcK+iEF79bfD6u0WS7k2RyJWz1lb9vmNZL9xIPiV0FfQhJz0ZRmAlao0+jJ4kxSfRn6k40QG34KSQEMHHePx8771dhpyshw04XolLhXoWCc/mIMux0IqT41ZGQKDiIFe4SpZTdTmJo+FTAJL4BjrlkNXSJ6dH19B9uC//85aDk0jpFO6Fb2Sq/n+3MH4BTVjk4odfRl3IOw+WR+KM57+9r5GCoxAOtUbrw93PGYQ8ptjtXjqjAdieiHNsciTIFB6nCXckIMbbZE6XYZkeIFGyF+IW4U4LttiVQcZfiUmwdnPLI9aOVfTKwSnn1tcJnXxj3hsiXXWf3ud0XDg5cz+6BY3QaZKG6GBZ6AoP1wIO2l+JhZykG2TeQ43cBup4F+MmxHD85EGUKd6UK9hIFO/GorbalCndEI4TYepsowVYbQqBgzcdPNnyouktwJbEBroUdA1dZTW67nEqXTXz277VMOZ3UpWZd0C8mV3jd2HbYBMehLkwLw2VBwHAjBvsbIa6thbD6r6lqqqP+n4d9lRjKs0K+nz7OeLCxxb4MW+yl2GInxWY7CTbbEmKFO6UKt0UKNsIRJdhsTQiw2UqAH6z4CpY8BWYx5SdrHk76lsMqoxlWWa1i3eAqtdVX8p5eBdt822Zdye61s8jrGzBK68K+gGYw/aNRF6aJYak/MFSLVEEljjiLcMD+rznvL0ZlQxUe9kowlMdEnq8edN2ysemOROG2eEQpNtkQImyyJoTYZCXEd1YlCpYCfGfJx3dMgofvLIhihVtFCuaFlG/NCrDLXoALUTW4ld48YJrQYLf1Nn/WUwWohMvXM/P6WKZZPdCKbsdWtwbc8otCbegJDEt8gMFKROZK8f1NAdaZ8v8SNSchhLJyPOwRYijXHLk+Z6DlmolvrEspG61F2GhFCLHRkijBRiYhULDgK9ziKZgXYwOlCBvMiEJsuEkUYMONfIXredhkXoATPlIYx9eTElgH7ovXPxb+M7uGV7TjOpSt8/vE+smdOBjUgm+da3HTJwK1occxLPEEBqRoapEgJq8UEdy/Jl0gxkCPFA+7eRjKvQmu92mccE7HfyxF+A9TqGBRonBLgP/c4lPW3+JhvTkP682KFW4WKdwoHFGA9deJfKy/RuThq6tELr66wsX6K1zscyzB2dAqWGW2iE/6lSt/cj5r7N5BybFhin5yp5Z1fl+jZqwcn96uwdcO1bjhFY7akGMYFrsB/SJ0yUXgCIXIEpRMSr5YiIFuEfW34z3sKsAQ9xq43qeg4ZiKL2+VYJ25QMGMT/nGRojf7pfhaKAMmqHV1M/f3MrwnU0J1l0vwLprBVC6mj8iD0pXiFwoXSa4UDIlOFAyYVM+Pp+NE75lsMxsbjwTUqm1yjhn7Dqw3rmBZsjqpFvl9bYfi2zDR5ZV+NKuClc9Q1ETchTDpS5AHw/xeTzssuZhq3nxpBy+ywNXxAP6+I952MnFEPcKOF46OGKfgjU3+Vhzg+BhnTkfyu7lMEtrQpi4C2l1/choGgSrfgAhkm7cymzGAa8yfGlWhC9Mc0dw8YUJwcFqY4KN1ZeIHKw2yqYsMsiAuqcElhnN7QZhMvpaUzZtrACnelIAwyqvV340ohVLmTK8ZyzBZfdg1ASrY1jkBPQWID6vELusirDVfHIO2xeBKyyk/na8hx3ZGOKYgO2pDVXbZKy8VoyVV4ux5iYP6n4yBAg6kN8+jMzOhwhvfQjPpj/g3vgHgloeIrn1AYJKu6AZIoPS9Xx8fomDz43YI3Lw+UUiG59fILLw+flMTD+SgIX66VD3EIOZ3iSnh8kYSqY54wpwrKMZsjoYVrk98qPhrVhqUYl3L4mhY+uPmmA1DIvuAj1cdLVywRHkIYs3OfmiPAx0cKm/He+hPB1D7EvI8dDEYZtErLhciBWmhdjjJqXCF3T+gZi2P+DS8AfMqh7gXPkD6EgeQFsyjCuVDxDR8gdCJV1Q8Zbis0scfHo+G8uJc1kjMrHcMIMyXT0e09XjsFAvDWrupSMFVDLWmmSPK8ChlmaYLB8poAVLb1XgHaNSnLgTCKmfKoZ5TKAzA+jOfiketsRhMIuONDdtKFsm4hPjfKw158EsrRG57cMIa/4D9+oewKH2AcxkD3C+bBhapcM4yB/CzqIhnJMOI7blAe5ymrGBWYSPGZkK9Ax8TE/Hxwbp+MggjQo+TY2IxcKzKVBzF4GZ3iinh1Yy1hpnjS+gZqSAbvnRsGYsNS/HWxdE2GqRjDhXXQywTuKB1BkP60P+tj/qgjDMZ6Iz6jA875li4/VMLL2Yi18cxYiQdCG+9QGsZcNgyoZhKRvGlfJhGIiHcLxkEPuKBrE1bwC/FgzgtmwYsbJeHHAXY4lBBhbrp2GxHpGKxWdTR4NPU42hLDjDgpqbCMy0RrlBaAVj7aXMsQK+ultNM0xqZ1hxSQFNWGomxVvnhZhrUgy92/eR434MHVGHMZCsMSnDBZef/e9Jx9AbcwA1CfqwDvPHcpNsLDrPhapvBVLrBnC/ZhiGpYO4JBmiMEoHoS0YhErRAHbl9eN7toK+cBAJDUPQD6/EUkYGFpxOocw/xXos+DSVaExTicKC08lQuy9UFBBSwVhrlDGuAPuqsQJCm7D0pgRvnRNQFpvkQc3SH7ftr8PL4Rwl4N44zgpxXnRI4ozQmWOMvtgDGObdRG/sPkiy9kCYuQO8zJ9QlLEF/KwdEPNOoaY5DDGlIux2ScOC82ycCKpESsMgLMoGcaJ4ADp8BfK7amE/9uT24cecPnyb1UvRKOpHTMMQjGOrsYSRgTk6yRMGn3Y4CtMORWLBqSSo3S8BM61BbhBSzlhrlD6uADsZzTCxjWHF7ZIfDWnEkhtizDTkYyaDR3mHUYRFl7hYYZKFFSaZWGFMZOCr61mUTRZpsEpkQ9YqQm2jHxrTVNEffwjD+cbojN6FAs5OuDbuxO2GTbhVvx62LTsR32MDaS8fNukFWHWNBXXfciTWDuBa6QD2cftwMFeB/L6T3Ystmb3YmN4z6kRhH2LqB3EushLvaiY9M/i0QxGYdjACC3QToeZaAmYqKaCMsfZi2rgCbCsVBXBIAQ1Ycr1UEZ5erGBQhJkGhZipTxRgpl4+5c2zeXjzTC7WMDMRLqxA9VAxMnvugV1+GnWJOzGQfBRDbDpqYrfCr3w7jBrXwrDhc4pd60Hk9YUjTSbBdodk/OIgRIS0G1aSAezI6sFPGQpb0rvxbWo3vk4ZszGlGxf5/Yit6sMB1xK8eTTumcGnHQzHGwfCsUAnAWquAjBT6+UGwWWMtRdSxxVwp4LGSGhlWHE65UeDG7DkmmhSwSmnudjlmoW8BhmK+mLgLzeEb4sWskpUUR/7C7UCSlhb4FT5IwxqP4NB7QqKcf3XiO60glAugk5gBlZeY+NOVhOCawZxhNOD9Umdz7Q3qxv3KwbgWdgKpaucPw3+xoEwvPF7KBZox0PNhT9SgJSx5nzK+ALKaYyEFqqAI8H1WHJVOKngb57m4O0zOTjqnwNhexlSu+7Dvvkwbjftg0v9QcSU7EFy/jZ4in/ChZq1OFv96SiD6pXwbj0PcU8RjGNyMIeehL0uImr35yjtx4GsbqyP78CXT9iV1oVbwj5EV/ZCy0+Mf2om/mlwyv4QzNeKhdo9Hpgp9XKDICljzTnWuAJul9EY8S0MS3an/EhQHZZcKXlu8DdPEWy8fSYLxwOyIJSLESO/gxt123Cldguu1G7G5ZpNMK7eAH3ZKpyqXP6YM5Ur4N5sgNKeApjG5OCfurGYY5AJ3cBy6qXgXt4Pen4Pfs/ows6UTiindeIUtxsO4n4qvEm0DB8bpj83+Bv7g/HGvmDM14wZKaBObhAkYawxTB4r4EsbKY0R38ywZHfIjwTWYsll/nODv6mbQ5mpm4X9HmkoaBIjtt0exlU/QL9iDeVM+UrolC2D9gTOlK+CX7MpRJ186AVn4N2TMdSWdT7Zs3uUwi2vhQoaIuuHb0U/Aiv7ESXrg19xO04HSPDJuXRMJ2f+OcHfUA7CG8qBmH8yGqrOxYoCAkkBSeMKsJY8VsBiU95zg7+pk40ZOlmYoZ2Fb2ySkCAVI7szBDeqduOk+OPnMqrYjIR2F+TWlWKvUwJmHIkb3bm9p5mEtVc5UHUT4VJUJcwSq2EaI8NxLxE23uTgX5oJkw7+xt5AvL43APNPREHVuQhMVq3cIFDMWMNIHFeAlZjGiGtiWObI5UcCarDYpHhSwWdoZ2KGVgYWXEgEMyUfwq4C+DSYQk/yFTREHz2TTulKONWeBr87HV65xVhpHEEFn6mRgI/OZeJXu2IYhpXDNr0eHnkt8Clsg1d+CxwyG2AcWYF9DsVYcSEdb6tHPTf463v8KfOPR0LVaaSAgFLGGnrCuAIsS8cVUI3FxkWTCj5Dk0jHTK1UbHcgq6AU+Z0JcKo5izOlX+GIYOlTtIWrYS07hoz2IHBqS3HEPQnvnIjE+1pJ+J6ZD9NoGQJ47Ygo74WftA/Owl7YC3rgVNILb0kfwst7EVIix63EKuywyccszbg/Df76bj+8vtsX8zUioOpUOFaAQfz4AkQ0RmyjogB/UkDhpILPOEmkYcaJVHyonwAt/3RkVomR35kIn7pruF62H/qib6Fb8iXOCjfAVPrbf291LyC7PRwFjSIYR2ZikUEo/qXDwu67PDjnNCKirAf2/B7oZXbg94Q2/BzZis3hLdga2YK9cW3QSZfDqqgboWW98MprxhFXHuZpxz0z+Ou/ET6Ydywcqo4FYCbXyPX9RYwv9OPGFcAU0hixDQzL7Hb5Eb8qLL5UMOnglOMpmH6chXn0WBz3SUW0UAiBvAhseTRim1wR1mCH6CZnZLaFQdCRi9RyEQxD0vHJuVD840QifrMvhkduCwIkvTiX1YFfIlqwyrcRn3g2POUz70b8ENqMU2lyeIh6EFjchqMuPHyoETVh8Nd3eVPmHQ2FqkM+LB4VoBc7rgCLEhoj5lEBMiw2yn+h4NM1iGRMP5aED3Rj8INVDEyishFUJEB6ZSk4NSJkykSIEAhgHs/Gr7YxmH0qFDPUY/DNzVw4ZzfCr7QHWqx2rPNrxFK3+uda5d0AlfhWuAp64Jvfgp1WXLx1MOip4K/v9ALtV0/MOxIyUkC1XN9PyPhCL2asgHW3BDRGTD3DMrtNfsS3Eosu5r5w8OlHk/Dh6Wj852YUjnmyYJ7AgXduMSIFJYgTCRFdUgK//GJYJ3Og45OMTebhWHM5DqZR5QgR9+AUqw2rPeux2KV20pa71UEtrhW+oh7cYVVjJSPpqeCUHR6YdyQYqnfzYJE0UsDZ6HEFmPNpjOh6hmVWm1ydFHCB+0LB39WMxZfXI0EPTkdIsQD5DULw2rngtiUgrTkErKYApDYHg90Wi2J5DgqbBIgVlsCNW4gIsRjXOfX4yrseC51qXtjnbnUwSG1DqLATx12K8O7BwMeC03a4g7bdHfPUg6B6N1dRgG8J44szUeMKMOPRGNF1igJ8KrDoPGdSwacfTcS/T0Vhj0M8PDhFVDBOazyCqm1xR6IHE/5B0Iu242zBVugX/gIj3j5YlurCR8ZERnMESjv4KGmvhkWeCF94CDD/bvVf8oNfPZyKunA3pRrLT8c+Fpy23Q20bW6YpxYIFXtSQJWigNOR4wsoptGjSAGtcnWfciw6x35ucLJrm3U6EupuSYgVlaCoLRtB1Xa4ylfHMc567MlYgh1pc7Ejbc5jfktfBLWctTAq3g/PSnPktbHAbqzApUwB1rjzMNdW9sKWOFThbFIrgnnt2HErC2/s9BwNTtt2H7RfXDFXNQAqdlxYJFbJ9X0EjC9ORYwr4GYRjR5Vy7DMbJWre5djkWHOnwYn3teKxCGXBCSIheC2JsNBYoSTnE3YkTIfv7BmP9c21lyoZ38JS+FppDWFg91QhvNpfHzqzMdsm8oXtiOgHv6CLpz15OGdfX6jwSk/u2Cuij9U7DiwSJTJ9X34jNW64eMKuFFIo0eSAlrk6l5lWMTIfmZwMmV982gMNjOjEFrMR25LCm4LGTiUsRZbE2e9sL2py3GddwJpjRFIqynHkehCzLstwr8tK16I0r1q3M3rgEV0GWarBY0Gf+2ne5S5h32hYju+gLBxBVwvoNEja0YKkGIhPWvC4I/26ksYobBM5KCwJQ9O4is4lKaEzXEf/mW7WcthwT+L3JY0+Aml+MY9Hx/cKn8hH92pxPX0NjilVmPpyfDR4K9tdcZrW50w95APVGzZsEiQyfW9eYzVOqFjBShdy6fRI6oZlhktcnVPKRYaZEwYnMzcZh6NxD6HWGRWChEmu48TmVuwKeZff9vB1C/hIWWioLkE9KRizLPk4f2b0kmbxyzHhaQWuGfVYYVO5Gjw134kHDH3oDdU7uTAIqFSUYB2yLgCruaNFNAsJ4+PyFOUJ4OPjpfPBsM6iYO85kxcK9TGlpj5+Cbyg7/tu6h/g87ej4yGGAQIpVjnxMV71ySTNstMCsP4ZqqAz3QiRoO/tsWBMveAF1TuZCsK8CpmrNYKHl9ALo0eUcVgkgI8xNRTlCeDP5q5fXMjDPEiASJknlBL+Q5fh/3zpdkdvwoeYiuw68Q4GJSH964K8c5l8aTMuSmFUUIzXNJq8MmJ0NHgr22+i9c222PO755QuZ0Ni/gKuR4pQDNoXAFXuDR6eBWDPDYij48WkgcLE0xZZ6qFQc0lDrl1PNjxTfFj5BJ8Ffz+S7MxdBau5Gkjv4mLS8nF+Pf1Asw0Fk3KYnMpzFJbcTu2HPNUA0aDT/2BsMOc/R5QsclSFOBZxFh1MnBcAZc5NHq4bKyAMykTTln/oRGESyFpyG3MgRFbA18FfQClwPdeKq20Xcioi4NrfilW2uRi9lXxpKy9XQ5nTjuMfPn4xx730eBTv7fF1E22mLPPHSo2mSMFFDJWnQwYV4Apm0aemFIFuImw4DRrwinrLM0AWCfkIKs+Cdqpu/GF37sv3YH4bxAjC0BOTQVupAphEt80aX55bThkmYVpPzuNBp+66Q6mfncbc5Tv47B1JiziyuV6HoWMVSf8xxVgkkMjT0zJYyM1NyEWnEqecNg4T8cPjqlcpNRE40jiz1jp/c5LtytyHULKPFBUVwan9ALYJ1ROLL7iMXYj1p2OxNTv7UaDU761wZy9rjhsnTFSQAFj1XG/sQLIk1KD0Ao6M62xXd1NiIWnkiacuc3T9oVjCges6mioxv+EFR5vv3Q7wpUQLHVHDK8Ym0z8sEA9GAvUg7BAjQgcoxqABar+mK9C+GH+YYUPyPIfF3zqt9aY+o015ux1gQpVQFm7nns+faWG71gBKy9kTDkTWKZlmdbYeNxThI/OJk84bPzwuA+s4rKQXpMIjYRdWOb2Fpa5zXypdkd8jYhyP/hlc/HRcYen3s6evLg9udSfDD71Gyu8utEKC3+/j6O2WaSARl2XXK1P1bzGPiLzsT7rlRNepcqWaQ3iM4FSrD6fimkTDBvfU/XGhQAW2HXZ0EtRxyb/T1861ZhtYFXFwD4uHbMP2f3t4K9utMTUjZb47Ig3TrnkghlXJj5ml6W8+Pf7j3/B4nfH4vXmrDrWpSgZvr+Rg7cPhz01bJy+3xeH7SOQU1UEd779/xh2bQ4MPaLx9i7bvxX81Q1MvPo1EzO+t8G3emG46M+HWbSEpXwzef1TnxPcYsaZZRItszNPrhs46FiEBVqxE05Z/2PkQ70+4/hPi+UXPY73LIVjip9UQNl1zROv/2j7t4K/+rUFZc5uZ+w3Y+FmlGTgUqDA7nt6+NMflFzJYE3R9hGpWabWiw2Cpdhgko63DwY/NWWdfcwdSue8oHTOU8HQA0qMEXR3KNHdxhgQ96Gk7zrCBWv1Rpy9h7VnnceccVI47Uj5RMPubwcnyNlfrxsEffcCavlrOrLVHnv9jz9+tcpddiW2ys08qXZA7V4xlp+Jx7S9/hNOWZ+cuT05gXnyfvzJu7OXdXF7VnDitY2W+PiwO1Ss0qizbxoidNtuHLvsmZ8W/9wgccoJd4GyBauWbRpdiT02uViiFYVppID/RcEfhV+43xW/XU2ASXAJzGOkbHLxe+bZf3R8dzn9ff0AMd0ypVZ8Kbwce6w5WK4bjbeU/f5XBH+07MmZJ+HJhY8s/bPu+fSNZ0Mn9/2hn82yFhoGS0wsWbVi06gKqDkW4OsLSZh/NARv7fHG6zv+/ws+dYPiak8ueOQ1T5Y9OfMkPN2r0GTrhagX+97QzzcyF+r7i+i3kqrZZglVAwb+Ihy4w8Um42SsPBWFxRoh1KSVDBvJvI1y2I8aPc095EtNYOYe9KEGEXMPeFP343N/96RuS+f87kHdnc3Z707dpMzZ50bt1Sl7XRX2uFBm776H2budMfu3iZHAZKmT93nyVkeu9uSCR17zZNmTM//C4R8d3xqz3j/uUqR8OarcjZlcLTaLlw0YhUpw2osPDed8qNpzqUkrGTZSbDnU2IlyJ2ecbOpeXCGLui1VyKRuUBQyFKyIdAXLtOciZ5rs8Mgmhyx3EpycdXLBI6/5SS/7Zx2f6UZN2WGWsUzLrVjNOExiZxYvYzGTqsTMpKpGi8SqdjJkHJXwSOXj4omKp8WVP6GMcit28ixiy9rJ9paEJpsc8j5P3urI1f65F7wXKkInYspmk+RZ+62y1x93zlc+5VGspefDp5MJK8Wb4I3xKh5FJjBkCDGmUMHjkQIFdyL/hZAlTvb25GyTHR7Z5LzU4BMdS44GvrJCM2TKap0wGhkvUz91QmmrtYkQ2motIlhBM4hCJjAKAbRVJwh/2qrjhB9tlYbvX7bymA+NBH5qb/9/x+SO/weVoZOZMEhqNgAAAABJRU5ErkJggg=='
+
+const MSN_2000S_ICON_PNG32 =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAALwElEQVR42oXXe1CTZ74H8MwwR1sEhN3Zs7tneed0d7a7ZbvH3Yqizra2tdhtXaRaWy+tCAgqXhC5c1xFZCsqkIQ7CPGFcAnhnkAwCQHCJYEEQgJJgBDuYhA0okDEoued75kEW+sudt+Zz9/f5/fkeb5vXhptlWd35YKdj2DRJUPzrWuG5gmRobZaWtHzeIXKyrKie/G5BSKjy2qeSLdSzhPpikeuX3NNLrtYE3a0f/dYg4ObHruxB5/6cIxPE7jGpyyu8Sm5YnnF0He+fcHw5J8skdzBJbJ0Bauk/3FCQd+iz2netNunN0ZWX8iXNQuvXZAt7aoyWth1A7OjldqZpdLeuxRH8wPq6e+VqO9SeeoFKke9SOX0LFLZNgtUtuo781R29zyVo5qnbmoWLMV6i6FEb2GdF8/s2ntz5LWXwr3K5+2s4TWGh6J2+a3lXiETKkEylLVJUPB/gJf4PRmPAXadGJF1JgTzZxDMu4tg3jSCa0wIrra6g+CqKZytmkJUnQlXpfeQq3pkKdYt8s8L7+76NHPwxU4ESxbdmOonLIGq78mwIBbLqlQ8VmX+qCeKJMjK4hBSpIJX7hi8bozCK2cEXtnD8Mo2witrCF6ZBnhlDGJP9iB82SM4X38H2V1zFobczDpVMeG2Mj13zi6+47EPXbVk4Eg7MVYXBYOiClm39K+ULdRjSlGAnvJohOS3YWeGETvTh7AzzQDP1EF4pg7AM6Ufnkw9PBk6eNK18KT34RDLgEtCE5La7xviGqZ9PknV2tEO8x66JHcvJcTLFy3Z9W0w8sLR185FbMXgK12q6Me4PA/d3EicypViO2MQ2+kD+CBlADszDPgobQDbk3R473ov3rumwXtX1Xj3ag92JKpxomQYceJpS2LrbMIh1qALLbBuzpWpesz6X+k8lVzdDEP1OehlRbjG061KO6zHnFmHp/psKDmhCMyUYGuiDntvDuOCyIT0jvtIbJ1FUMU4PmRo4RGvwubLXdgcp4RHnBIHb+gRXXuborffY/mzDa60Y3UPCKbKQsY0PaSi2CIMVp6Bvp1EUnXXqrQGJbCgwDNdKhTFIfBNFcErdwh5XWbIZpfRPEfh1r3/Q9WIBVG1k/D4RoUNf+/AhvNybDgvg0e8EpG8CYreNkseZQ8StGO1ZoLZbSGjG+eoc/kSdBSfwbLyIhYV8at6qlqx3BGNztIQHEoRI0Ywhda7yxCaKdAnnuH88DPkTD1Dif4RvLO0+H1kG34f0QqHoyJ4XO5EZM04RW+dIY8WDBC0Y/x7BLNrkYyWPKC8b+hwPjUTNXlhEOWHQkSGoqHgHNSVYbgnPoeF5pMwt53E/bYTmG0Ng6yFjcMFcjDaZiCYeYZ44zJO677FF6onCNF/i6qxx/BjD+LX56RY5yeEg98teFySI7J6jKK33iX9yX6CFlgzSzC7FsjoBjO1LW0Eb1zsxtb4Zmy7LMG2uAb45YrRoFZidjgXc40+mJDuA2/SF0334qG5r0C8uA9XmyfBnVzGCfUSdssteL9lEaF9Syg3LsI7oxcOfvVYd0QAhyN18LjYjsjqUYreMk3639QRtMDqGYKpnCejxfepbSlGOEeosT68B05hKjiFdsE7TwnZlBHdD/PR2XMQStknYI7+Bckz+6BYrMZNRT9OlveBO7iAhP4l+CksONVtwc2RJ0hvn8afLsiwzqcO6w7zbTZfaEVk1QhFl06T/iwtQQusmiaYikdktOgetY1pwPrnwU7nlHAKUWBvbifapvTgP6Dj2sRfETfsgZDRP+KbKS+0z5fhZocOWxNacLZ8GGzNHDhDiygdXEBG+zS8mD1w9hfA/mse7L+qwbpD1dh8XorISiNFl5pI/7xeghZYaSIY1gUIZ6mt9AGsfx7sFNwBxzNybEtsRaV2AM1zxbg2cQAhxk2IHP4LWKZwKM1tuFTbjTejJdh+tRv++f0IKzfibKkBX2ao8T8xLVjvWwv7Q9WwP1gJ+wMV2BzThIiKIYrefIf0z9UQtMCKKYLR+ZCMEs5QW5P0cDrbaQt2PC2D46k2/CKsGSHlXWiZ7EWzuQSl0wmommGiwyxGmVqHz7Na4MvSI7N9GsXahyjsX0CRfh5stRn/EIxhxxU5nH1q8Pr+cth/WYZN0RJElBsoetMU6XdDTdACym8TjI45MurWNLU1UQunMyvBjidb4RjUAocTUvw2RozTnE5wVDo0DPehflCL9GYN9mU0w4/sRX73fWT0LiBYOoevhGb4ih/g7x2PkK+dR3LDBLZdkML+Cy7s93GwKVKMiLJBit50m/TLVhG0AO4kweh4QEbVm6gt13rhdOpFsMPxJriGiuCdLsU39SqUdGvB12lR3adFXpsG10U9KFQNg6F6gN3Vs3g734Tfsu7gTdYdbCqaxjGxGfmah4jk9ONX/tV4fW8xNoULEcEdoJIbb5N+Wd0ELaB0nGDIzWSU4A61JUENx+fBDsca8ZtIIYI5HeDrtWibbkK9qQBlk6movJ2JxrsV6J7pRs/MFC7KRvC7G6N4I2vyJRtYU4iRPkBuuwnbYiR4/TM23EPrEVHaTyVLJkm/TCVBC+CMEQyZmYyqm6K2XFHB8VgjHAIl+PmZWwgqlEE8pEHdVAGuaI8jqPNDHG53h6/MA6Hdu5FluADZrBiVQ2P4G7cfrswx/Io5/hJv7jTILjMO0OVY91kB3M/VIYKjp5IlE6RfhoKgBZSMEAzZfTKq9ja15R9dcAhosFXmBwkilPf0oW6yEOHKffib+DfwFP7XS/Y3/xlJ2lC0mlpxXT4Mt3Q9fn595CVbcieR1fkAQTndcNpTAPezfISXaKnkhnHSN72ToB0tHiYY7ffISP4k5XFZAQd/IX56vBZhHBmaJ1pxWRWEjwVvYDv/F6s62OgB9hADdUYDPi3U4j+vGF/yTvoY0uVmnMzpgpM3CfczNQgv7qOSxWOkb5qcoB0tMhKMtlnS+obyiOuAg68Avw7hIbOpB/yxYhyWvI+tlT97pXerfolLyuOQm5TIVIzgeNVtHKs0vSRbNouvk9pgv+sGNp6uQnhR78oCUmQE7SjbQNDbZsjImjHKI9Zam7V4O6IGRR1qFAyk4RPe23Dn/PRHBTXtQcuUBEK9EWkNRqSJxpEmGlshtBrF9nAB1npmYOPJCoQXaqhk0Sjpy2wjaP75A6701hlWVM0YtSW2Heu+rsEfwqpQKO8BqUvBEeEn/1aA2BsNoyLEl7diw+kKuAVWwi2gAm4B5XjraBne8ueCOMDG2h1pcD9ZjohCDZUkHGH50FtdaQdz+lwSm00Jl+onLDuvduInR3j476AypImVEAzX/gj+C0Y+RIYWHKHXwP7TLKzdmYU1nplY81E61uxIw5oPU7HmgxQ4fpyOHRF8XCzXWa4JjAlfXpG40P56XWl3qX7CJ6nJZPDN64NbiAguh0txlmxCTEkLYoqliCluXlHUhJiiRsQUNiLaii1BNLsB0QUNiM4X492wglWD/+N9Bta8z8CbX+XDh96C6/VGw8Vync9HUfyVv+ZBhf1udKmJFVs3ZvmcqcRbZwT4pS8HPzlYCJcDBXDZnw+X/SScv2DBeV8enD/PhfPeHDjvyYbzZ9lY752J9bszsN4rHWs/SsfaHalY82EK1nzAtAU77ky1he+5LLJNb93+45kdbt9/F3x8RWYXU2XcxZDe4cfWjlh8s3vgGSfF5gihrbncQwW2AnEPqbXdY/dgnu06bTxTbTvVG09V2g7XxqBybDxRho0nuHjneCneOcaB+wkudkTwbJNbw+miUX5UsWbX99N/93gnyl+LqRzaldx0m5XYMGmI5Rktkdx+ytpaVuEcHWUtEJvivhVFvSsKNVR4oZoKZ1v1vCSiUE1Zg63bbp3cGu518dZrq34f7rwstTtxU+MWyzP6XBeNJyRLJljWykxusBpfIR57QTT63AiZLFydNdR64Ky/uXXb/2XyVRcSK7Hbn9zuciS909ValzZpHYS1uXxTZYS1QHxT2gnrPbZhtL6S9apZT/urgv8fbQcwnO4rTRwAAAAASUVORK5CYII='
+
 function createMsnTrayIcon(): Electron.NativeImage {
-  // Ícone SVG clássico dos dois bonequinhos verde/azul do MSN
-  const svg = `
-  <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
-    <defs>
-      <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0%" stop-color="#4facfe"/>
-        <stop offset="100%" stop-color="#00f2fe"/>
-      </linearGradient>
-      <linearGradient id="buddyGreen" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#76ff03"/>
-        <stop offset="100%" stop-color="#33691e"/>
-      </linearGradient>
-      <linearGradient id="buddyBlue" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#40c4ff"/>
-        <stop offset="100%" stop-color="#01579b"/>
-      </linearGradient>
-    </defs>
-    <rect width="64" height="64" rx="14" fill="url(#bg)"/>
-    <circle cx="38" cy="20" r="8" fill="url(#buddyBlue)" stroke="#fff" stroke-width="2"/>
-    <path d="M26 44 C26 32, 50 32, 50 44 Z" fill="url(#buddyBlue)" stroke="#fff" stroke-width="2"/>
-    <circle cx="24" cy="24" r="9" fill="url(#buddyGreen)" stroke="#fff" stroke-width="2"/>
-    <path d="M10 50 C10 36, 38 36, 38 50 Z" fill="url(#buddyGreen)" stroke="#fff" stroke-width="2"/>
-  </svg>`
-  return nativeImage.createFromDataURL(
-    `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`
-  )
+  const candidatePaths = [
+    join(process.resourcesPath || '', 'app.asar.unpacked', 'resources', 'icon.ico'),
+    join(process.resourcesPath || '', 'resources', 'icon.ico'),
+    join(__dirname, '../../resources/icon.ico'),
+    join(__dirname, '../../build/icon.ico')
+  ]
+  for (const p of candidatePaths) {
+    try {
+      if (existsSync(p)) {
+        const img = nativeImage.createFromPath(p)
+        if (!img.isEmpty()) return img
+      }
+    } catch {}
+  }
+  return nativeImage.createFromDataURL(MSN_2000S_ICON_PNG64)
+}
+
+function createMsnTraySmallIcon(): Electron.NativeImage {
+  const img = nativeImage.createFromDataURL(MSN_2000S_ICON_PNG32)
+  return img.resize({ width: 16, height: 16 })
 }
 
 // ============================================================================
@@ -414,7 +415,7 @@ async function createMainWindow(): Promise<void> {
     minHeight: 560,
     show: false,
     autoHideMenuBar: true,
-    title: 'Windows Live Messenger - Vitinho & Will (Gaming Edition)',
+    title: 'Vitinho e Will',
     icon,
     backgroundColor: '#d9ecff',
     webPreferences: {
@@ -425,6 +426,8 @@ async function createMainWindow(): Promise<void> {
       backgroundThrottling: false // Mantém WebRTC e áudio vivos quando minimizado durante jogos
     }
   })
+
+  mainWindow.setIcon(icon)
 
   mainWindow.on('ready-to-show', () => {
     mainWindow?.show()
@@ -493,7 +496,7 @@ async function openAlbumRankerWindow(): Promise<void> {
     minHeight: 640,
     show: false,
     autoHideMenuBar: true,
-    title: 'MSN Music — Rankeador de Álbuns (Vitinho vs Will)',
+    title: 'Vitinho e Will — Rankeador de Álbuns',
     icon,
     backgroundColor: '#0f172a',
     webPreferences: {
@@ -503,6 +506,8 @@ async function openAlbumRankerWindow(): Promise<void> {
       nodeIntegration: false
     }
   })
+
+  rankerWindow.setIcon(icon)
 
   rankerWindow.on('ready-to-show', () => {
     rankerWindow?.show()
@@ -525,13 +530,13 @@ async function openAlbumRankerWindow(): Promise<void> {
 // 7. SYSTEM TRAY (BANDEJA DO SISTEMA) E ATALHO GLOBAL DE MUTE (Ctrl+Shift+M)
 // ============================================================================
 function setupSystemTray(): void {
-  const icon = createMsnTrayIcon()
-  tray = new Tray(icon.resize({ width: 16, height: 16 }))
-  tray.setToolTip('MSN Messenger Privado (Vitinho & Will)')
+  const icon = createMsnTraySmallIcon()
+  tray = new Tray(icon)
+  tray.setToolTip('Vitinho e Will')
 
   const contextMenu = Menu.buildFromTemplate([
     {
-      label: 'Abrir MSN Messenger',
+      label: 'Abrir Vitinho e Will',
       click: () => {
         mainWindow?.show()
         mainWindow?.focus()
