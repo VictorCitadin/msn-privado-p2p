@@ -1070,10 +1070,46 @@ const MainMsnMessengerWindow: React.FC = () => {
                 updaterInfo.status === 'checking' ? 'animate-spin' : ''
               }`}
             />
-            <span>Verificar Atualização</span>
+            <span>Verificar Atualização (v{appVersion})</span>
           </button>
         </div>
       </nav>
+
+      {/* BANNER DE STATUS DO AUTO-UPDATER NA TELA DE CHAT */}
+      {updaterInfo.status !== 'idle' && (
+        <div className="bg-[#eef6ff] border-b border-[#7da2ce] px-4 py-1.5 flex items-center justify-between text-xs text-[#164273]">
+          <div className="flex items-center gap-2 font-bold">
+            <RefreshCw
+              className={`w-3.5 h-3.5 text-[#2664a5] ${
+                updaterInfo.status === 'checking' || updaterInfo.status === 'downloading'
+                  ? 'animate-spin'
+                  : ''
+              }`}
+            />
+            <span>{updaterInfo.message}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            {updaterInfo.status === 'downloading' && (
+              <div className="w-36 h-2.5 bg-white rounded-full overflow-hidden border border-[#7da2ce]">
+                <div
+                  className="h-full bg-[#52b700] transition-all"
+                  style={{ width: `${updaterInfo.percent || 0}%` }}
+                />
+              </div>
+            )}
+            {updaterInfo.status === 'downloaded' && (
+              <button
+                type="button"
+                onClick={() => window.msnApi.quitAndInstallUpdate()}
+                className="px-3 py-1 rounded bg-[#52b700] hover:brightness-110 text-white font-extrabold text-xs flex items-center gap-1 shadow"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Reiniciar e Instalar Atualização</span>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* ALERTA DE LIGAÇÃO RECEBIDA */}
       {incomingCallFrom && !inCall && (
