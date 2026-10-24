@@ -3,6 +3,7 @@ import {
   Video,
   VideoOff,
   Monitor,
+  MonitorOff,
   BellRing,
   Disc,
   Trophy,
@@ -220,6 +221,7 @@ const MainMsnMessengerWindow: React.FC = () => {
   })
 
   const remoteVoiceAudioRef = useRef<HTMLAudioElement | null>(null)
+  const remoteScreenAudioRef = useRef<HTMLAudioElement | null>(null)
   const localCamElementsRef = useRef<Set<HTMLVideoElement>>(new Set())
   const remoteCamElementsRef = useRef<Set<HTMLVideoElement>>(new Set())
   const remoteScreenVideoRef = useRef<HTMLVideoElement | null>(null)
@@ -384,6 +386,31 @@ const MainMsnMessengerWindow: React.FC = () => {
       }
     }
 
+    // O <audio id="remote-screen-audio"> reproduz o som do filme/sistema sem engasgos
+    if (remoteScreenAudioRef.current) {
+      const screenAudioStream = st.remoteScreen
+      if (
+        !isScreenSharing &&
+        remoteScreenSharing &&
+        screenAudioStream &&
+        screenAudioStream.getAudioTracks().length > 0
+      ) {
+        remoteScreenAudioRef.current.muted = false
+        remoteScreenAudioRef.current.volume = djState.isPlaying
+          ? 0
+          : Math.max(0, Math.min(1, screenMovieVolume / 100))
+        if (remoteScreenAudioRef.current.srcObject !== screenAudioStream) {
+          remoteScreenAudioRef.current.srcObject = screenAudioStream
+          remoteScreenAudioRef.current.play().catch(() => {})
+        }
+      } else {
+        if (remoteScreenAudioRef.current.srcObject !== null) {
+          remoteScreenAudioRef.current.srcObject = null
+          remoteScreenAudioRef.current.pause()
+        }
+      }
+    }
+
     // Se a janela estiver minimizada/oculta no System Tray ou em Modo Eco sem foco, desconecta o srcObject dos <video>
     if (!isWindowVisible) {
       for (const el of localCamElementsRef.current) {
@@ -392,7 +419,12 @@ const MainMsnMessengerWindow: React.FC = () => {
       for (const el of remoteCamElementsRef.current) {
         if (el.isConnected) el.srcObject = null
       }
-      if (remoteScreenVideoRef.current) remoteScreenVideoRef.current.srcObject = null
+      if (remoteScreenVideoRef.current && remoteScreenVideoRef.current.srcObject !== null) {
+        remoteScreenVideoRef.current.srcObject = null
+        remoteScreenVideoRef.current.pause()
+        remoteScreenVideoRef.current.removeAttribute('src')
+        remoteScreenVideoRef.current.load()
+      }
       return
     }
 
@@ -412,16 +444,24 @@ const MainMsnMessengerWindow: React.FC = () => {
       }
     }
 
-    // Vídeo da Tela Compartilhada (Modo Cinema)
+    // Vídeo da Tela Compartilhada (Modo Cinema): limpa imediatamente ao parar de compartilhar
     const activeScreenStream = st.remoteScreen || st.localScreen
-    if (
-      remoteScreenVideoRef.current &&
-      remoteScreenVideoRef.current.srcObject !== activeScreenStream
-    ) {
-      remoteScreenVideoRef.current.srcObject = activeScreenStream
-      remoteScreenVideoRef.current.play().catch(() => {})
+    if (remoteScreenVideoRef.current) {
+      if (activeScreenStream && (isScreenSharing || remoteScreenSharing)) {
+        if (remoteScreenVideoRef.current.srcObject !== activeScreenStream) {
+          remoteScreenVideoRef.current.srcObject = activeScreenStream
+          remoteScreenVideoRef.current.play().catch(() => {})
+        }
+      } else {
+        if (remoteScreenVideoRef.current.srcObject !== null) {
+          remoteScreenVideoRef.current.srcObject = null
+          remoteScreenVideoRef.current.pause()
+          remoteScreenVideoRef.current.removeAttribute('src')
+          remoteScreenVideoRef.current.load()
+        }
+      }
     }
-  }, [isWindowVisible])
+  }, [isWindowVisible, isScreenSharing, remoteScreenSharing, djState.isPlaying, screenMovieVolume])
 
   const bindLocalCamRef = useCallback(
     (el: HTMLVideoElement | null) => {
@@ -485,10 +525,12 @@ const MainMsnMessengerWindow: React.FC = () => {
   // Além disso, silencia o áudio da tela compartilhada enquanto o DJ Bot estiver tocando para nunca tocar a música 2x!
   useEffect(() => {
     webrtcRef.current?.setDjBotPlayingState(djState.isPlaying)
+    const targetVolume = djState.isPlaying ? 0 : Math.max(0, Math.min(1, screenMovieVolume / 100))
+    if (remoteScreenAudioRef.current) {
+      remoteScreenAudioRef.current.volume = targetVolume
+    }
     if (remoteScreenVideoRef.current) {
-      remoteScreenVideoRef.current.volume = djState.isPlaying
-        ? 0
-        : Math.max(0, Math.min(1, screenMovieVolume / 100))
+      remoteScreenVideoRef.current.volume = targetVolume
     }
   }, [screenMovieVolume, isScreenSharing, remoteScreenSharing, djState.isPlaying])
 
@@ -625,6 +667,18 @@ const MainMsnMessengerWindow: React.FC = () => {
           setRoomViewActive(false)
           setIsScreenSharing(false)
           setRemoteScreenSharing(false)
+        }
+        if (!state.isScreenSharing && !state.remoteScreenSharing) {
+          if (remoteScreenVideoRef.current) {
+            remoteScreenVideoRef.current.srcObject = null
+            remoteScreenVideoRef.current.pause()
+            remoteScreenVideoRef.current.removeAttribute('src')
+            remoteScreenVideoRef.current.load()
+          }
+          if (remoteScreenAudioRef.current) {
+            remoteScreenAudioRef.current.srcObject = null
+            remoteScreenAudioRef.current.pause()
+          }
         }
         soundManager.stopRingLoop()
       },
@@ -1114,6 +1168,9 @@ const MainMsnMessengerWindow: React.FC = () => {
       {/* ELEMENTO <audio id="remote-voice"> REPRODUZ A VOZ DO AMIGO NATIVAMENTE */}
       <audio id="remote-voice" ref={remoteVoiceAudioRef} autoPlay playsInline />
 
+      {/* ELEMENTO <audio id="remote-screen-audio"> REPRODUZ O ÁUDIO DO SISTEMA/FILME NATIVAMENTE SEM ENGASGOS */}
+      <audio id="remote-screen-audio" ref={remoteScreenAudioRef} autoPlay playsInline />
+
       {/* MODAL DE SELEÇÃO DE JANELA / TELA (desktopCapturer) */}
       <ScreenShareModal
         isOpen={screenModalOpen}
@@ -1516,13 +1573,13 @@ const MainMsnMessengerWindow: React.FC = () => {
               onMouseMove={handleCinemaMouseMove}
               className="relative w-full h-full bg-black overflow-hidden select-none cursor-default"
             >
-              {/* Compartilhamento de Tela em Tela Cheia ao Fundo */}
+              {/* Compartilhamento de Tela em Tela Cheia ao Fundo (Áudio gerenciado pelo remoteScreenAudioRef) */}
               <video
                 id="remote-screen"
                 ref={remoteScreenVideoRef}
                 autoPlay
                 playsInline
-                muted={isScreenSharing}
+                muted
                 className="w-full h-full object-contain bg-black"
               />
 
@@ -1726,6 +1783,20 @@ const MainMsnMessengerWindow: React.FC = () => {
                       </>
                     )}
                   </button>
+
+                  {isScreenSharing && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        webrtcRef.current?.stopScreenShare()
+                      }}
+                      className="px-3.5 py-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-lg"
+                      title="Parar de transmitir sua tela"
+                    >
+                      <MonitorOff className="w-4 h-4" />
+                      <span>Parar Transmissão</span>
+                    </button>
+                  )}
 
                   <button
                     type="button"

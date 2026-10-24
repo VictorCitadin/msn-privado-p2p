@@ -91,6 +91,12 @@ export type DataChannelPacket =
       rating: number
     }
   | {
+      type: 'screen-share-state'
+      sender: MsnUser
+      active: boolean
+      screenStreamId?: string | null
+    }
+  | {
       type: 'stream-meta'
       sender: MsnUser
       micStreamId: string | null
@@ -256,6 +262,9 @@ export class MsnWebRTCService {
   private unsubLoopbackAudio: (() => void) | null = null
   private loopbackAudioProcessor: ScriptProcessorNode | null = null
   private loopbackAudioDestNode: MediaStreamAudioDestinationNode | null = null
+  private loopbackAudioGainNode: GainNode | null = null
+  private loopbackAudioCompressorNode: DynamicsCompressorNode | null = null
+  private loopbackAudioDummyNode: GainNode | null = null
 
   // Buffer de recepção de arquivos P2P
   private incomingFiles: Map<string, IncomingFileBuffer> = new Map()
@@ -402,7 +411,8 @@ export class MsnWebRTCService {
       | 'ice-candidate'
       | 'hangup'
       | 'renegotiate-offer'
-      | 'room-sync-request',
+      | 'room-sync-request'
+      | 'screen-share-state',
     data: Record<string, unknown>
   ): Promise<void> {
     // Envio instantâneo e com latência mínima via WebSocket do Supabase Realtime Broadcast
@@ -452,8 +462,12 @@ export class MsnWebRTCService {
 
     pc.ontrack = (event) => {
       this.routeRemoteTrack(event.track, event.streams)
+      this.emitStreamsUpdated()
+      this.emitCallState()
       event.track.onunmute = () => {
         this.routeRemoteTrack(event.track, event.streams)
+        this.emitStreamsUpdated()
+        this.emitCallState()
       }
     }
 
@@ -489,8 +503,9 @@ export class MsnWebRTCService {
     if (track.kind === 'audio') {
       // Transceiver 0 de áudio é SEMPRE o microfone do amigo
       const isVoice = audioTransceivers.length > 0 && audioTransceivers[0].receiver.track?.id === track.id
-      // Transceiver 1 de áudio (se houver) é SEMPRE o áudio do filme/sistema da tela
+      // Transceiver 1 de áudio (se houver) é o áudio da tela compartilhada se a tela estiver ativa
       const isScreenAudio =
+        Boolean(this.remoteStreamIds.screenStreamId) &&
         audioTransceivers.length > 1 &&
         (audioTransceivers[1].receiver.track?.id === track.id || !isVoice)
 
@@ -511,8 +526,9 @@ export class MsnWebRTCService {
     } else if (track.kind === 'video') {
       // Transceiver 0 de vídeo é SEMPRE a câmera do amigo
       const isCam = videoTransceivers.length > 0 && videoTransceivers[0].receiver.track?.id === track.id
-      // Transceiver 1 de vídeo (se houver) é SEMPRE a tela compartilhada
+      // Transceiver 1 de vídeo (se houver) é a tela compartilhada, SOMENTE se estiver ativa
       const isScreenVideo =
+        Boolean(this.remoteStreamIds.screenStreamId) &&
         videoTransceivers.length > 1 &&
         (videoTransceivers[1].receiver.track?.id === track.id || !isCam)
 
@@ -532,6 +548,20 @@ export class MsnWebRTCService {
         if (!this.remoteCamStream || !this.remoteCamStream.getVideoTracks().some((t) => t.id === track.id)) {
           this.remoteCamStream = new MediaStream([track])
         }
+      }
+    }
+
+    track.onmute = () => {
+      if (
+        this.remoteScreenStream &&
+        this.remoteScreenStream.getVideoTracks().some((t) => t.id === track.id)
+      ) {
+        this.remoteScreenStream.removeTrack(track)
+        if (this.remoteScreenStream.getVideoTracks().length === 0) {
+          this.remoteScreenStream = null
+        }
+        this.emitStreamsUpdated()
+        this.emitCallState()
       }
     }
 
@@ -588,9 +618,13 @@ export class MsnWebRTCService {
     if (!this.peerConnection) return
     for (const receiver of this.peerConnection.getReceivers()) {
       const track = receiver.track
-      if (track && track.readyState === 'live') {
+      if (track && track.readyState === 'live' && !track.muted) {
         this.routeRemoteTrack(track)
       }
+    }
+    if (!this.remoteStreamIds.screenStreamId && this.remoteScreenStream) {
+      this.remoteScreenStream.getTracks().forEach((t) => t.stop())
+      this.remoteScreenStream = null
     }
   }
 
@@ -1126,6 +1160,18 @@ export class MsnWebRTCService {
       }
     }
 
+    this.sendDataChannelPacket({
+      type: 'screen-share-state',
+      sender: this.myUser,
+      active: true,
+      screenStreamId: finalScreenStream.id
+    })
+    this.sendSignal('screen-share-state', {
+      sender: this.myUser,
+      active: true,
+      screenStreamId: finalScreenStream.id
+    }).catch(() => {})
+
     await this.renegotiatePeerConnection()
     this.emitStreamsUpdated()
     this.emitCallState()
@@ -1133,6 +1179,17 @@ export class MsnWebRTCService {
 
   public async stopScreenShare(): Promise<void> {
     if (!this.localScreenStream) return
+
+    // 1. Notifica imediatamente o amigo via DataChannel e Realtime que o compartilhamento encerrou
+    this.sendDataChannelPacket({
+      type: 'screen-share-state',
+      sender: this.myUser,
+      active: false
+    })
+    this.sendSignal('screen-share-state', {
+      sender: this.myUser,
+      active: false
+    }).catch(() => {})
 
     const pc = this.peerConnection
     if (pc) {
@@ -1152,6 +1209,7 @@ export class MsnWebRTCService {
       await this.applySmartCornerCameraConstraints(false)
     }
 
+    this.broadcastStreamMeta()
     await this.renegotiatePeerConnection()
     this.emitStreamsUpdated()
     this.emitCallState()
@@ -1342,6 +1400,28 @@ export class MsnWebRTCService {
         camStreamId: string | null
         screenStreamId: string | null
       }
+      if (!this.remoteStreamIds.screenStreamId && this.remoteScreenStream) {
+        this.remoteScreenStream.getTracks().forEach((t) => t.stop())
+        this.remoteScreenStream = null
+        this.emitStreamsUpdated()
+        this.emitCallState()
+      }
+    }
+
+    if (type === 'screen-share-state') {
+      const active = Boolean(data.active)
+      if (!active) {
+        if (this.remoteScreenStream) {
+          this.remoteScreenStream.getTracks().forEach((t) => t.stop())
+          this.remoteScreenStream = null
+        }
+        this.remoteStreamIds.screenStreamId = null
+        this.emitStreamsUpdated()
+        this.emitCallState()
+      } else {
+        this.remoteStreamIds.screenStreamId = (data.screenStreamId as string) || null
+      }
+      return
     }
 
     if (typeof data.inRoom === 'boolean') {
@@ -1669,50 +1749,96 @@ export class MsnWebRTCService {
       }
 
       const dest = ctx.createMediaStreamDestination()
-      const queue: Float32Array[] = []
-      let queueOffset = 0
+
+      // Jitter Buffer em Ring Buffer estéreo (1 segundo de capacidade = 48000 frames)
+      const RING_FRAMES = 48000
+      const ringL = new Float32Array(RING_FRAMES)
+      const ringR = new Float32Array(RING_FRAMES)
+      let writeIdx = 0
+      let readIdx = 0
+      let bufferedFrames = 0
 
       this.unsubLoopbackAudio = window.msnApi.onLoopbackAudioChunk((chunk: Uint8Array) => {
-        const int16 = new Int16Array(chunk.buffer, chunk.byteOffset, chunk.byteLength / 2)
-        const floatSamples = new Float32Array(int16.length)
-        for (let i = 0; i < int16.length; i++) {
-          floatSamples[i] = int16[i] / 32768.0
+        // Garante alinhamento exato de 4 bytes (2 bytes x 2 canais PCM 16-bit)
+        const validBytes = chunk.byteLength - (chunk.byteLength % 4)
+        if (validBytes <= 0) return
+
+        // Cópia alinhada para ArrayBuffer independente evitando RangeError de offset ímpar
+        const safeBuffer = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + validBytes)
+        const int16 = new Int16Array(safeBuffer)
+        const frames = int16.length / 2
+
+        for (let i = 0; i < frames; i++) {
+          const sampleL = int16[i * 2] / 32768.0
+          const sampleR = int16[i * 2 + 1] / 32768.0
+
+          ringL[writeIdx] = sampleL
+          ringR[writeIdx] = sampleR
+          writeIdx = (writeIdx + 1) % RING_FRAMES
+          if (bufferedFrames < RING_FRAMES) {
+            bufferedFrames++
+          } else {
+            readIdx = (readIdx + 1) % RING_FRAMES
+          }
         }
-        queue.push(floatSamples)
-        while (queue.length > 8) {
-          queue.shift()
+
+        // Mantém a latência do áudio baixa e ultra estável (~50ms)
+        if (bufferedFrames > 4800) {
+          const skip = bufferedFrames - 2400
+          readIdx = (readIdx + skip) % RING_FRAMES
+          bufferedFrames -= skip
         }
       })
 
-      const processor = ctx.createScriptProcessor(2048, 0, 2)
+      // ScriptProcessor com buffer de 1024 frames (~21ms a 48kHz)
+      const processor = ctx.createScriptProcessor(1024, 0, 2)
       processor.onaudioprocess = (e) => {
         const outL = e.outputBuffer.getChannelData(0)
         const outR = e.outputBuffer.getChannelData(1)
         const len = outL.length
 
         for (let i = 0; i < len; i++) {
-          if (queue.length === 0) {
+          if (bufferedFrames > 0) {
+            outL[i] = ringL[readIdx]
+            outR[i] = ringR[readIdx]
+            readIdx = (readIdx + 1) % RING_FRAMES
+            bufferedFrames--
+          } else {
             outL[i] = 0
             outR[i] = 0
-            continue
-          }
-          const chunkSamples = queue[0]
-          outL[i] = chunkSamples[queueOffset] || 0
-          outR[i] = chunkSamples[queueOffset + 1] || 0
-          queueOffset += 2
-
-          if (queueOffset >= chunkSamples.length) {
-            queue.shift()
-            queueOffset = 0
           }
         }
       }
 
-      processor.connect(dest)
+      // 1. Boost de Volume de 2.5x para som do sistema alto, claro e equilibrado
+      const boostGain = ctx.createGain()
+      boostGain.gain.value = 2.5
+
+      // 2. Dynamics Compressor de hardware/estúdio: limita picos e previne clipping/distorção em volumes altos
+      const compressor = ctx.createDynamicsCompressor()
+      compressor.threshold.value = -6
+      compressor.knee.value = 6
+      compressor.ratio.value = 8
+      compressor.attack.value = 0.003
+      compressor.release.value = 0.1
+
+      processor.connect(boostGain)
+      boostGain.connect(compressor)
+      compressor.connect(dest)
+
+      // 3. Keep-alive com ganho zero para ctx.destination (impede que o Chromium pause ou faça GC do ScriptProcessor com 0 entradas)
+      const dummyNode = ctx.createGain()
+      dummyNode.gain.value = 0
+      processor.connect(dummyNode)
+      dummyNode.connect(ctx.destination)
+
       this.loopbackAudioProcessor = processor
       this.loopbackAudioDestNode = dest
+      this.loopbackAudioGainNode = boostGain
+      this.loopbackAudioCompressorNode = compressor
+      this.loopbackAudioDummyNode = dummyNode
 
-      console.log('[WebRTC] Áudio de tela nativo (Zero Retorno de Voz) inicializado com sucesso!')
+      console.log('[WebRTC] Áudio de tela nativo (Zero Retorno de Voz + Boost 2.5x) inicializado!')
       return dest.stream.getAudioTracks()[0] || null
     } catch (err) {
       console.warn('[WebRTC] Falha ao iniciar loopback nativo:', err)
@@ -1734,6 +1860,24 @@ export class MsnWebRTCService {
         this.loopbackAudioProcessor.disconnect()
       } catch {}
       this.loopbackAudioProcessor = null
+    }
+    if (this.loopbackAudioGainNode) {
+      try {
+        this.loopbackAudioGainNode.disconnect()
+      } catch {}
+      this.loopbackAudioGainNode = null
+    }
+    if (this.loopbackAudioCompressorNode) {
+      try {
+        this.loopbackAudioCompressorNode.disconnect()
+      } catch {}
+      this.loopbackAudioCompressorNode = null
+    }
+    if (this.loopbackAudioDummyNode) {
+      try {
+        this.loopbackAudioDummyNode.disconnect()
+      } catch {}
+      this.loopbackAudioDummyNode = null
     }
     this.loopbackAudioDestNode = null
 
@@ -2015,11 +2159,31 @@ export class MsnWebRTCService {
         })
         break
 
+      case 'screen-share-state':
+        if (!packet.active) {
+          if (this.remoteScreenStream) {
+            this.remoteScreenStream.getTracks().forEach((t) => t.stop())
+            this.remoteScreenStream = null
+          }
+          this.remoteStreamIds.screenStreamId = null
+          this.emitStreamsUpdated()
+          this.emitCallState()
+        } else {
+          this.remoteStreamIds.screenStreamId = packet.screenStreamId || null
+        }
+        break
+
       case 'stream-meta':
         this.remoteStreamIds = {
           micStreamId: packet.micStreamId,
           camStreamId: packet.camStreamId,
           screenStreamId: packet.screenStreamId
+        }
+        if (!packet.screenStreamId && this.remoteScreenStream) {
+          this.remoteScreenStream.getTracks().forEach((t) => t.stop())
+          this.remoteScreenStream = null
+          this.emitStreamsUpdated()
+          this.emitCallState()
         }
         break
 
@@ -2349,7 +2513,9 @@ export class MsnWebRTCService {
       incomingCallFrom: this.incomingCallFrom,
       isScreenSharing: Boolean(this.localScreenStream),
       remoteScreenSharing: Boolean(
-        this.remoteScreenStream && this.remoteScreenStream.getVideoTracks().length > 0
+        this.remoteScreenStream &&
+          this.remoteScreenStream.getVideoTracks().length > 0 &&
+          Boolean(this.remoteStreamIds.screenStreamId)
       )
     })
   }
