@@ -24,9 +24,8 @@ export const ScreenShareModal: React.FC<ScreenShareModalProps> = ({
     try {
       const list = await window.msnApi.getDesktopSources()
       setSources(list)
-      if (list.length > 0 && !selectedId) {
-        setSelectedId(list[0].id)
-      }
+      // Mantém a seleção apenas se a janela/tela ainda existir (ex: jogo fechado desde a última vez)
+      setSelectedId((prev) => (list.some((src) => src.id === prev) ? prev : list[0]?.id || ''))
     } catch (err) {
       console.error('[ScreenShareModal] Erro ao listar janelas/telas:', err)
     } finally {

@@ -67,6 +67,8 @@ export type DataChannelPacket =
   | {
       type: 'dj-sync'
       state: DjSyncState
+      // true quando é o envio do estado atual ao (re)abrir o DataChannel, não uma ação do usuário
+      initial?: boolean
     }
   | {
       type: 'album-ranked'
@@ -129,6 +131,7 @@ export type DataChannelPacket =
   | {
       type: 'file-end'
       transferId: string
+      aborted?: boolean
     }
 
 interface IncomingFileBuffer {
@@ -137,7 +140,7 @@ interface IncomingFileBuffer {
   fileSize: number
   mimeType: string
   totalChunks: number
-  chunks: string[]
+  chunks: Array<Uint8Array<ArrayBuffer> | undefined>
   receivedCount: number
 }
 
@@ -152,7 +155,7 @@ export interface WebRTCCallbacks {
   onDataChannelOpen?: () => void
   onNudgeReceived: (sender: MsnUser) => void
   onSoundboardWink: (sender: MsnUser, winkId: SoundboardWinkId, label: string) => void
-  onDjSync: (state: DjSyncState) => void
+  onDjSync: (state: DjSyncState, initial: boolean) => void
   onAlbumRankedNotification: (payload: {
     user: MsnUser
     albumId: string
@@ -223,7 +226,7 @@ export class MsnWebRTCService {
   }
 
   private pendingOffer: RTCSessionDescriptionInit | null = null
-  private pendingIceCandidates: RTCIceCandidateInit[] = []
+  private pendingIceCandidates: Array<{ candidate: RTCIceCandidateInit; pcId: string | null }> = []
   private incomingCallFrom: MsnUser | null = null
   private inCall = false
   private friendInRoom = false
@@ -285,6 +288,18 @@ export class MsnWebRTCService {
   private offlineGraceTimeout: ReturnType<typeof setTimeout> | null = null
   private realtimeReconnectTimeout: ReturnType<typeof setTimeout> | null = null
   private realtimeBackoffMs = 2000
+  // Geração do canal Realtime: callbacks de canais antigos (ex: CLOSED ao remover) são ignorados
+  private realtimeGeneration = 0
+  private realtimeSubscribedAt = 0
+
+  // Identidade da PeerConnection local e da remota pareada com ela. Permite detectar quando o
+  // amigo recriou a PeerConnection (oferta nova não pode ser aplicada sobre a conexão antiga).
+  private localPcId: string | null = null
+  private remotePcId: string | null = null
+  private lastChatOfferAt = 0
+  // Stream ID de cada trilha remota (vindo do ontrack), usado quando a trilha é re-roteada sem o evento
+  private remoteTrackStreamIds: Map<string, string> = new Map()
+  private remoteVoiceBoostConnected = false
 
   // Monitoramento de Saúde da Ligação e Auto-Drop
   private callHealth: 'connecting' | 'healthy' | 'degraded' | 'recovering' | 'dead' = 'connecting'
@@ -386,26 +401,60 @@ export class MsnWebRTCService {
   }
 
   private setupRealtimeChannel(): void {
-    if (!this.supabase || this.isDestroyed) return
+    const supabase = this.supabase
+    if (!supabase || this.isDestroyed) return
 
-    if (this.realtimeChannel) {
-      try {
-        this.supabase.removeChannel(this.realtimeChannel)
-      } catch {}
-      this.realtimeChannel = null
+    const generation = ++this.realtimeGeneration
+    if (this.realtimeReconnectTimeout) {
+      clearTimeout(this.realtimeReconnectTimeout)
+      this.realtimeReconnectTimeout = null
     }
 
-    this.realtimeChannel = this.supabase.channel('msn-vitinho-will', {
+    // O canal antigo precisa sair da lista do cliente ANTES de criar o novo: enquanto ele estiver lá,
+    // supabase.channel() devolve o mesmo objeto (já inscrito) e o subscribe() lança exceção.
+    const previous = this.realtimeChannel
+    this.realtimeChannel = null
+    const removal: Promise<unknown> = previous
+      ? supabase.removeChannel(previous).catch(() => 'error')
+      : Promise.resolve('ok')
+
+    removal.then(() => {
+      if (this.isDestroyed || generation !== this.realtimeGeneration) return
+      try {
+        this.createRealtimeChannel(supabase, generation)
+      } catch (err) {
+        console.warn('[WebRTC] Falha ao criar canal Realtime:', err)
+        this.scheduleRealtimeReconnect(generation)
+      }
+    })
+  }
+
+  private scheduleRealtimeReconnect(generation: number): void {
+    if (this.isDestroyed || generation !== this.realtimeGeneration || this.realtimeReconnectTimeout) {
+      return
+    }
+    this.realtimeReconnectTimeout = setTimeout(() => {
+      this.realtimeReconnectTimeout = null
+      this.realtimeBackoffMs = Math.min(this.realtimeBackoffMs * 2, 30000)
+      this.setupRealtimeChannel()
+    }, this.realtimeBackoffMs)
+  }
+
+  private createRealtimeChannel(supabase: SupabaseClient, generation: number): void {
+    const channel = supabase.channel('msn-vitinho-will', {
       config: {
         presence: { key: this.myUser },
         broadcast: { self: false }
       }
     })
+    this.realtimeChannel = channel
+    const isCurrent = (): boolean =>
+      !this.isDestroyed && generation === this.realtimeGeneration && this.realtimeChannel === channel
 
-    this.realtimeChannel
+    channel
       .on('presence', { event: 'sync' }, () => {
-        if (this.isDestroyed) return
-        const state = this.realtimeChannel?.presenceState() || {}
+        if (!isCurrent()) return
+        const state = channel.presenceState() || {}
         const rawList = (state[this.friendUser] as Array<{
           user?: string
           status?: PresenceStatus
@@ -438,6 +487,12 @@ export class MsnWebRTCService {
           this.friendLastSubnick = newSubnick
           const justLoggedIn = this.friendLastStatus === 'offline' && newStatus !== 'offline'
           this.friendLastStatus = newStatus
+
+          // A presença é re-sincronizada a cada heartbeat (~4s). As ações de (re)negociação abaixo só
+          // devem rodar quando o estado do amigo muda; antes elas renegociavam a cada evento sync.
+          const roomStateChanged =
+            typeof latest.inRoom === 'boolean' && latest.inRoom !== this.friendInRoom
+          const friendStateChanged = justLoggedIn || roomStateChanged
 
           if (typeof latest.inRoom === 'boolean') {
             const wasInRoom = this.friendInRoom
@@ -482,7 +537,7 @@ export class MsnWebRTCService {
                 console.log('[WebRTC] Will está na sala e Vitinho no chat: Vitinho conectando para receber câmera...')
                 this.connectReceiveOnlyCall().catch(() => {})
               }
-            } else {
+            } else if (friendStateChanged || !this.peerConnection) {
               // Will está no chat e Vitinho entrou na sala: Will solicita oferta para receber câmera de Vitinho no chat
               console.log('[WebRTC] Vitinho está na sala e Will no chat: Will solicitando preview de câmera...')
               this.sendSignal('room-sync-request', { inRoom: false, wantsPreview: true }).catch(() => {})
@@ -490,11 +545,17 @@ export class MsnWebRTCService {
           } else if (this.inCall && !latest.inRoom) {
             // Eu estou na sala e o amigo acabou de ficar online no chat:
             if (this.myUser === 'Vitinho') {
-              console.log('[WebRTC] Vitinho na sala e Will no chat: Vitinho enviando stream para preview de Will...')
-              this.renegotiatePeerConnection().catch(() => {})
+              const isDisconnected =
+                !this.peerConnection || this.peerConnection.signalingState === 'closed'
+              if (isDisconnected) {
+                this.rebuildCall().catch(() => {})
+              } else if (friendStateChanged) {
+                console.log('[WebRTC] Vitinho na sala e Will no chat: Vitinho enviando stream para preview de Will...')
+                this.renegotiatePeerConnection().catch(() => {})
+              }
             }
-          } else if (!this.peerConnection && this.myUser === 'Vitinho') {
-            this.connectDataChannelOnly().catch(() => {})
+          } else if (this.myUser === 'Vitinho') {
+            this.ensureChatDataChannel()
           }
         } else {
           // Lista de presença vazia temporariamente (ex: reconexão): tolerância de 8s antes de marcar offline
@@ -507,31 +568,32 @@ export class MsnWebRTCService {
         }
       })
       .on('broadcast', { event: 'webrtc-signal' }, async ({ payload }) => {
-        if (!payload || payload.target !== this.myUser) return
+        if (!isCurrent() || !payload || payload.target !== this.myUser) return
         this.lastFriendSignalReceived = Date.now()
         this.lastFriendRealtimeHeartbeat = Date.now()
-        await this.handleIncomingSignal(payload.sender, payload.type, payload.data)
+        try {
+          await this.handleIncomingSignal(payload.sender, payload.type, payload.data || {})
+        } catch (err) {
+          console.warn(`[WebRTC] Erro ao processar sinal "${payload.type}":`, err)
+        }
       })
       .on('broadcast', { event: 'msn-packet' }, ({ payload }) => {
-        if (!payload || payload.target !== this.myUser) return
+        if (!isCurrent() || !payload || payload.target !== this.myUser) return
         this.lastFriendSignalReceived = Date.now()
         this.lastFriendRealtimeHeartbeat = Date.now()
         this.handleDataChannelPacket(payload.packet)
       })
-      .subscribe(async (status) => {
-        if (this.isDestroyed) return
+      .subscribe((status) => {
+        // Ignora o CLOSED disparado pela remoção de um canal antigo: era isso que gerava
+        // um loop infinito de reconexões (cada canal removido agendava a criação de outro).
+        if (!isCurrent()) return
         if (status === 'SUBSCRIBED') {
           this.realtimeBackoffMs = 2000
+          this.realtimeSubscribedAt = Date.now()
           this.trackPresenceState()
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
           console.warn('[WebRTC] Canal Realtime reconectando status:', status)
-          if (!this.isDestroyed && !this.realtimeReconnectTimeout) {
-            this.realtimeReconnectTimeout = setTimeout(() => {
-              this.realtimeReconnectTimeout = null
-              this.realtimeBackoffMs = Math.min(this.realtimeBackoffMs * 2, 30000)
-              this.setupRealtimeChannel()
-            }, this.realtimeBackoffMs)
-          }
+          this.scheduleRealtimeReconnect(generation)
         }
       })
   }
@@ -547,20 +609,58 @@ export class MsnWebRTCService {
       console.log('[WebRTC] Timeout de presença/sinais do amigo: marcando como offline.')
       this.markFriendOffline()
     }
+
+    // Reabre o DataChannel do chat caso a oferta anterior tenha se perdido ou a conexão tenha falhado
+    if (isOnline && !this.inCall && this.myUser === 'Vitinho') {
+      this.ensureChatDataChannel()
+    }
   }
 
   private computeIsFriendOnline(): boolean {
-    const state = this.realtimeChannel?.presenceState() || {}
-    const rawList = (state[this.friendUser] as any[]) || []
-    if (rawList.length > 0) return true
-
     const now = Date.now()
     const p2pActive =
       this.lastFriendP2PHeartbeat > 0 && now - this.lastFriendP2PHeartbeat < 15000
     const signalActive =
       this.lastFriendSignalReceived > 0 && now - this.lastFriendSignalReceived < 30000
 
+    // Enquanto o canal Realtime está sendo recriado (ou acabou de entrar e ainda não recebeu o
+    // primeiro sync), a lista de presença vazia não significa que o amigo saiu: mantém o status
+    // atual para não gerar um falso "offline" seguido de um falso "acabou de entrar".
+    const presenceUncertain =
+      !this.realtimeChannel || now - this.realtimeSubscribedAt < 10000
+    if (presenceUncertain) {
+      return this.friendLastStatus !== 'offline' || p2pActive || signalActive
+    }
+
+    const state = this.realtimeChannel?.presenceState() || {}
+    const rawList = (state[this.friendUser] as unknown[]) || []
+    if (rawList.length > 0) return true
+
     return p2pActive || signalActive
+  }
+
+  /**
+   * (Vitinho) Garante um DataChannel de chat aberto quando ninguém está na sala.
+   * Antes, se a oferta inicial se perdesse (amigo offline) ou o ICE falhasse fora de ligação,
+   * a PeerConnection ficava presa e o chat dependia só do fallback Realtime para sempre.
+   */
+  private ensureChatDataChannel(): void {
+    if (this.myUser !== 'Vitinho' || this.isDestroyed || this.inCall) return
+    if (this.dataChannel?.readyState === 'open') return
+
+    const pc = this.peerConnection
+    if (pc && pc.signalingState !== 'closed') {
+      const stillNegotiating =
+        pc.connectionState === 'new' ||
+        pc.connectionState === 'connecting' ||
+        this.dataChannel?.readyState === 'connecting'
+      if (stillNegotiating && Date.now() - this.lastChatOfferAt < 15000) return
+    }
+
+    console.log('[WebRTC] DataChannel do chat indisponível: recriando conexão P2P...')
+    this.resetPeerConnection()
+    const connect = this.friendInRoom ? this.connectReceiveOnlyCall() : this.connectDataChannelOnly()
+    connect.catch(() => {})
   }
 
   private markFriendOffline(): void {
@@ -606,7 +706,8 @@ export class MsnWebRTCService {
             sender: this.myUser,
             target: this.friendUser,
             type,
-            data
+            // pcId = minha PeerConnection atual; remotePcId = a do amigo com quem ela está pareada
+            data: { pcId: this.localPcId, remotePcId: this.remotePcId, ...data }
           }
         })
       } catch (err) {
@@ -628,9 +729,12 @@ export class MsnWebRTCService {
       bundlePolicy: 'max-bundle',
       rtcpMuxPolicy: 'require'
     })
+    this.localPcId = `${Math.random().toString(36).slice(2, 10)}-${Date.now()}`
+    this.remotePcId = null
+    this.remoteTrackStreamIds.clear()
 
     pc.onicecandidate = (event) => {
-      if (event.candidate) {
+      if (event.candidate && pc === this.peerConnection) {
         this.sendSignal('ice-candidate', {
           candidate: event.candidate.toJSON()
         })
@@ -638,10 +742,15 @@ export class MsnWebRTCService {
     }
 
     pc.ondatachannel = (event) => {
+      if (pc !== this.peerConnection) return
       this.setupDataChannel(event.channel)
     }
 
     pc.ontrack = (event) => {
+      if (pc !== this.peerConnection) return
+      if (event.streams[0]) {
+        this.remoteTrackStreamIds.set(event.track.id, event.streams[0].id)
+      }
       this.routeRemoteTrack(event.track, event.streams)
       this.emitStreamsUpdated()
       this.emitCallState()
@@ -727,7 +836,12 @@ export class MsnWebRTCService {
   private routeRemoteTrack(track: MediaStreamTrack, streams?: readonly MediaStream[]): void {
     if (!track || track.readyState === 'ended' || !this.peerConnection) return
 
-    const streamId = streams && streams.length > 0 ? streams[0].id : null
+    // Quando re-roteada sem o evento ontrack (syncRemoteStreamsFromReceivers), usa o stream ID
+    // memorizado; sem isso a trilha da tela caía no fallback por índice e substituía a câmera.
+    const streamId =
+      streams && streams.length > 0
+        ? streams[0].id
+        : this.remoteTrackStreamIds.get(track.id) || null
 
     const audioTransceivers = this.peerConnection
       .getTransceivers()
@@ -739,8 +853,8 @@ export class MsnWebRTCService {
     if (track.kind === 'audio') {
       let isScreenAudio = false
       if (this.remoteStreamIds.screenStreamId) {
-        if (streamId && streamId === this.remoteStreamIds.screenStreamId) {
-          isScreenAudio = true
+        if (streamId) {
+          isScreenAudio = streamId === this.remoteStreamIds.screenStreamId
         } else if (audioTransceivers.length > 1 && audioTransceivers[1].receiver.track?.id === track.id) {
           isScreenAudio = true
         }
@@ -763,8 +877,8 @@ export class MsnWebRTCService {
     } else if (track.kind === 'video') {
       let isScreenVideo = false
       if (this.remoteStreamIds.screenStreamId) {
-        if (streamId && streamId === this.remoteStreamIds.screenStreamId) {
-          isScreenVideo = true
+        if (streamId) {
+          isScreenVideo = streamId === this.remoteStreamIds.screenStreamId
         } else if (videoTransceivers.length > 1 && videoTransceivers[1].receiver.track?.id === track.id) {
           isScreenVideo = true
         }
@@ -859,13 +973,20 @@ export class MsnWebRTCService {
       this.setupDataChannel(dc)
     }
 
-    const offer = await pc.createOffer()
-    await this.setLocalDescriptionSafe(pc, offer)
-    await this.sendSignal('sdp-offer', {
-      sdp: pc.localDescription,
-      isMediaCall: false,
-      streamIds: this.getLocalStreamIds()
-    })
+    this.lastChatOfferAt = Date.now()
+    this.makingOffer = true
+    try {
+      const offer = await pc.createOffer()
+      if (pc.signalingState === 'closed') return
+      await this.setLocalDescriptionSafe(pc, offer)
+      await this.sendSignal('sdp-offer', {
+        sdp: pc.localDescription,
+        isMediaCall: false,
+        streamIds: this.getLocalStreamIds()
+      })
+    } finally {
+      this.makingOffer = false
+    }
   }
 
   public async connectReceiveOnlyCall(): Promise<void> {
@@ -886,6 +1007,7 @@ export class MsnWebRTCService {
     }
 
     if (this.myUser === 'Vitinho') {
+      this.lastChatOfferAt = Date.now()
       this.makingOffer = true
       try {
         const offer = await pc.createOffer({
@@ -1012,11 +1134,13 @@ export class MsnWebRTCService {
 
   private async flushPendingIceCandidates(pc: RTCPeerConnection): Promise<void> {
     if (!pc.remoteDescription || this.pendingIceCandidates.length === 0) return
-    const candidates = [...this.pendingIceCandidates]
+    const candidates = this.pendingIceCandidates.filter(
+      (c) => !c.pcId || !this.remotePcId || c.pcId === this.remotePcId
+    )
     this.pendingIceCandidates = []
     for (const c of candidates) {
       try {
-        await pc.addIceCandidate(new RTCIceCandidate(c))
+        await pc.addIceCandidate(new RTCIceCandidate(c.candidate))
       } catch (err) {
         console.warn('[WebRTC] Erro ao adicionar ICE candidate da fila:', err)
       }
@@ -1283,13 +1407,24 @@ export class MsnWebRTCService {
     const micTrack = this.localMicStream?.getAudioTracks()[0]
     const camTrack = this.localCamStream?.getVideoTracks()[0]
 
+    // Os transceivers da tela compartilhada nunca podem ser tratados como mic/câmera: sem webcam
+    // (ou sem microfone) o transceiver da tela era o primeiro do tipo e acabava virando 'recvonly',
+    // fazendo a transmissão de tela nunca chegar ao amigo.
+    const screenTrackIds = new Set((this.localScreenStream?.getTracks() || []).map((t) => t.id))
+    const isScreenTransceiver = (t: RTCRtpTransceiver): boolean =>
+      Boolean(t.sender.track && screenTrackIds.has(t.sender.track.id))
+    const directionFor = (t: RTCRtpTransceiver, localTrack?: MediaStreamTrack): RTCRtpTransceiverDirection =>
+      localTrack || t.sender.track ? 'sendrecv' : 'recvonly'
+
     // Transceiver 0: Áudio da Voz (Microfone)
-    const audioTransceiver = transceivers.find((t) => t.receiver.track?.kind === 'audio')
+    const audioTransceiver = transceivers.find(
+      (t) => t.receiver.track?.kind === 'audio' && !isScreenTransceiver(t)
+    )
     if (audioTransceiver) {
       if (micTrack && audioTransceiver.sender.track?.id !== micTrack.id) {
         await audioTransceiver.sender.replaceTrack(micTrack).catch(() => {})
       }
-      audioTransceiver.direction = micTrack ? 'sendrecv' : 'recvonly'
+      audioTransceiver.direction = directionFor(audioTransceiver, micTrack)
     } else {
       pc.addTransceiver('audio', {
         direction: micTrack ? 'sendrecv' : 'recvonly',
@@ -1304,12 +1439,14 @@ export class MsnWebRTCService {
     }
 
     // Transceiver 0: Vídeo da Câmera (Webcam)
-    const videoTransceiver = transceivers.find((t) => t.receiver.track?.kind === 'video')
+    const videoTransceiver = transceivers.find(
+      (t) => t.receiver.track?.kind === 'video' && !isScreenTransceiver(t)
+    )
     if (videoTransceiver) {
       if (camTrack && videoTransceiver.sender.track?.id !== camTrack.id) {
         await videoTransceiver.sender.replaceTrack(camTrack).catch(() => {})
       }
-      videoTransceiver.direction = camTrack ? 'sendrecv' : 'recvonly'
+      videoTransceiver.direction = directionFor(videoTransceiver, camTrack)
     } else {
       pc.addTransceiver('video', {
         direction: camTrack ? 'sendrecv' : 'recvonly',
@@ -1372,6 +1509,11 @@ export class MsnWebRTCService {
   public async startScreenShare(sourceId: string, includeSystemAudio: boolean): Promise<void> {
     if (!this.inCall) {
       await this.startCall(true)
+    }
+    // Trocar de janela/tela: encerra a transmissão anterior para não deixar a captura antiga
+    // rodando (e sendo enviada) junto com a nova.
+    if (this.localScreenStream) {
+      await this.stopScreenShare()
     }
 
     const constraints: MediaStreamConstraints = {
@@ -1759,6 +1901,7 @@ export class MsnWebRTCService {
     this.friendInRoom = false
     this.friendJoinedThisCall = false
     this.stopCallHealthTimers()
+    this.applyRemoteVoiceOutput()
     this.cleanupMediaStreams()
     this.resetPeerConnection()
     this.trackPresenceState()
@@ -1914,6 +2057,7 @@ export class MsnWebRTCService {
   private resetPeerConnection(): void {
     if (this.peerConnection) {
       this.peerConnection.ontrack = null
+      this.peerConnection.ondatachannel = null
       this.peerConnection.onicecandidate = null
       this.peerConnection.oniceconnectionstatechange = null
       this.peerConnection.onconnectionstatechange = null
@@ -1923,8 +2067,18 @@ export class MsnWebRTCService {
       } catch {}
       this.peerConnection = null
     }
+    if (this.dataChannel) {
+      this.dataChannel.onopen = null
+      this.dataChannel.onmessage = null
+      try {
+        this.dataChannel.close()
+      } catch {}
+    }
     this.dataChannel = null
     this.pendingIceCandidates = []
+    this.localPcId = null
+    this.remotePcId = null
+    this.remoteTrackStreamIds.clear()
   }
 
   private getLocalStreamIds(): {
@@ -1994,19 +2148,12 @@ export class MsnWebRTCService {
       this.emitCallState()
     }
 
+    const senderPcId = typeof data.pcId === 'string' ? data.pcId : null
+    const senderTargetPcId = typeof data.remotePcId === 'string' ? data.remotePcId : null
+
     if (type === 'room-sync-request') {
       if (this.myUser === 'Vitinho') {
-        if (this.inCall) {
-          if (this.peerConnection && this.peerConnection.signalingState === 'stable') {
-            this.renegotiatePeerConnection().catch(() => {})
-          } else {
-            this.rebuildCall().catch(() => {})
-          }
-        } else {
-          // Vitinho está no chat, mas Will entrou na sala:
-          // Conecta em modo de recepção para exibir a webcam de Will no avatar do chat!
-          this.connectReceiveOnlyCall().catch(() => {})
-        }
+        this.handleRoomSyncRequest(senderPcId)
       }
       return
     }
@@ -2019,6 +2166,27 @@ export class MsnWebRTCService {
         this.friendInRoom = data.inRoom
       } else if (isMediaCall) {
         this.friendInRoom = true
+      }
+
+      // Renegociação de uma PeerConnection do amigo que estava pareada com uma conexão minha que
+      // já foi descartada: não dá para responder (DTLS/m-lines não batem). Pede uma conexão nova.
+      if (senderTargetPcId && senderTargetPcId !== this.localPcId) {
+        console.log('[WebRTC] Oferta destinada a uma PeerConnection antiga: solicitando conexão nova...')
+        this.requestFreshNegotiation()
+        return
+      }
+
+      // O amigo recriou a PeerConnection dele (ex: saiu da sala, reconstrução após queda).
+      // Aplicar a oferta nova na conexão antiga falhava ("order of m-lines doesn't match") e a
+      // ligação só voltava depois de várias tentativas de ICE restart. Descarta a antiga.
+      if (
+        senderPcId &&
+        this.peerConnection &&
+        this.remotePcId !== senderPcId &&
+        (this.remotePcId !== null || this.peerConnection.remoteDescription)
+      ) {
+        console.log('[WebRTC] Amigo recriou a PeerConnection: descartando a conexão antiga.')
+        this.resetPeerConnection()
       }
 
       const pc = this.ensurePeerConnection()
@@ -2042,6 +2210,9 @@ export class MsnWebRTCService {
       }
 
       await pc.setRemoteDescription(new RTCSessionDescription(sdp))
+      if (senderPcId) {
+        this.remotePcId = senderPcId
+      }
       await this.flushPendingIceCandidates(pc)
       this.syncRemoteStreamsFromReceivers()
 
@@ -2075,12 +2246,19 @@ export class MsnWebRTCService {
       if (typeof data.inRoom === 'boolean') {
         this.friendInRoom = data.inRoom
       }
+      // Resposta a uma oferta de uma PeerConnection minha que já foi descartada
+      if (senderTargetPcId && senderTargetPcId !== this.localPcId) {
+        return
+      }
       if (
         this.peerConnection &&
         (this.peerConnection.signalingState === 'have-local-offer' ||
           this.peerConnection.signalingState === 'have-remote-pranswer')
       ) {
         await this.peerConnection.setRemoteDescription(new RTCSessionDescription(sdp))
+        if (senderPcId) {
+          this.remotePcId = senderPcId
+        }
         await this.flushPendingIceCandidates(this.peerConnection)
         this.syncRemoteStreamsFromReceivers()
         this.emitStreamsUpdated()
@@ -2092,6 +2270,8 @@ export class MsnWebRTCService {
     if (type === 'ice-candidate') {
       const candidate = data.candidate as RTCIceCandidateInit
       if (!candidate) return
+      // Candidato de uma PeerConnection do amigo diferente da que está pareada com a minha
+      if (senderPcId && this.remotePcId && senderPcId !== this.remotePcId) return
       if (
         this.peerConnection &&
         this.peerConnection.remoteDescription &&
@@ -2099,7 +2279,7 @@ export class MsnWebRTCService {
       ) {
         await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {})
       } else {
-        this.pendingIceCandidates.push(candidate)
+        this.pendingIceCandidates.push({ candidate, pcId: senderPcId })
       }
       return
     }
@@ -2107,7 +2287,12 @@ export class MsnWebRTCService {
     if (type === 'reconnect-request') {
       console.log('[WebRTC] Solicitação de reconexão recebida de Will.')
       if (this.myUser === 'Vitinho') {
-        this.triggerAutoReconnect().catch(() => {})
+        if (senderPcId && senderPcId !== this.remotePcId) {
+          // Will já está com outra PeerConnection: ICE restart na antiga não adianta
+          this.handleRoomSyncRequest(senderPcId)
+        } else {
+          this.triggerAutoReconnect().catch(() => {})
+        }
       }
       return
     }
@@ -2138,12 +2323,88 @@ export class MsnWebRTCService {
         camStreamId: null,
         screenStreamId: null
       }
-      if (!this.inCall && this.myUser === 'Vitinho' && (!this.dataChannel || this.dataChannel.readyState !== 'open')) {
+      // Quem sai da sala fecha a própria PeerConnection. Se era a que estava pareada com a minha,
+      // a minha virou um "zumbi" (o DataChannel ainda aparece 'open' por alguns segundos e as
+      // mensagens enviadas nele se perdiam). Descarta e, sendo Vitinho, renegocia do zero.
+      const pairedPcClosed = !senderPcId || senderPcId === this.remotePcId
+      if (this.peerConnection && pairedPcClosed) {
+        this.resetPeerConnection()
+        if (this.myUser === 'Vitinho') {
+          const reconnect = this.inCall ? this.rebuildCall() : this.connectDataChannelOnly()
+          reconnect.catch(() => {})
+        }
+      } else if (
+        !this.inCall &&
+        this.myUser === 'Vitinho' &&
+        (!this.dataChannel || this.dataChannel.readyState !== 'open')
+      ) {
         this.connectDataChannelOnly().catch(() => {})
       }
       this.emitStreamsUpdated()
       this.emitCallState()
       return
+    }
+  }
+
+  /**
+   * (Vitinho) Will pediu uma oferta: se a PeerConnection dele é a que está pareada com a minha,
+   * basta renegociar; se ele está com uma conexão nova (ou nenhuma), recria a minha do zero.
+   */
+  private handleRoomSyncRequest(requesterPcId: string | null): void {
+    const pc = this.peerConnection
+    const pairedWithRequester =
+      pc !== null &&
+      pc.signalingState !== 'closed' &&
+      requesterPcId !== null &&
+      this.remotePcId === requesterPcId
+
+    // Já existe uma oferta inicial aguardando resposta: a conexão nova do Will pode aceitá-la,
+    // então só reenvia em vez de recriar tudo (evita uma cascata de reconstruções).
+    if (
+      pc &&
+      pc.signalingState === 'have-local-offer' &&
+      this.remotePcId === null &&
+      pc.localDescription
+    ) {
+      this.sendSignal('sdp-offer', {
+        sdp: pc.localDescription,
+        isMediaCall: this.inCall || this.friendInRoom,
+        inRoom: this.inCall,
+        streamIds: this.getLocalStreamIds()
+      }).catch(() => {})
+      return
+    }
+
+    if (this.inCall) {
+      if (pairedWithRequester && pc?.signalingState === 'stable') {
+        this.renegotiatePeerConnection().catch(() => {})
+      } else {
+        this.rebuildCall().catch(() => {})
+      }
+      return
+    }
+
+    // Vitinho está no chat: conecta em modo de recepção para exibir a webcam de Will no avatar
+    if (!pairedWithRequester) {
+      this.resetPeerConnection()
+    }
+    this.connectReceiveOnlyCall().catch(() => {})
+  }
+
+  /**
+   * Recebi uma renegociação destinada a uma PeerConnection que eu já descartei.
+   */
+  private requestFreshNegotiation(): void {
+    if (this.myUser === 'Vitinho') {
+      if (this.inCall) {
+        this.rebuildCall().catch(() => {})
+      } else {
+        this.resetPeerConnection()
+        const connect = this.friendInRoom ? this.connectReceiveOnlyCall() : this.connectDataChannelOnly()
+        connect.catch(() => {})
+      }
+    } else {
+      this.sendSignal('room-sync-request', { inRoom: this.inCall }).catch(() => {})
     }
   }
 
@@ -2610,18 +2871,18 @@ export class MsnWebRTCService {
       const analyser = ctx.createAnalyser()
       analyser.fftSize = 256
       const gainNode = ctx.createGain()
-      const gainValue = this.inCall
-        ? Math.max(0, Math.min(2, this.remoteVoiceVolumePercent / 100))
-        : 0
-      gainNode.gain.value = gainValue
 
-      // O <audio id="remote-voice"> no DOM reproduz nativamente a voz do amigo com estabilidade absoluta,
-      // enquanto o analyser detecta atividade vocal para os efeitos de interface (VAD).
+      // O <audio id="remote-voice"> no DOM reproduz nativamente a voz do amigo de 0% a 100%;
+      // acima de 100% o elemento é mutado e a voz sai por este GainNode (ver applyRemoteVoiceOutput).
+      // O analyser detecta atividade vocal para os efeitos de interface (VAD).
       source.connect(analyser)
+      source.connect(gainNode)
 
       this.remoteVoiceSourceNode = source
       this.remoteVoiceGainNode = gainNode
+      this.remoteVoiceBoostConnected = false
       this.remoteAnalyser = analyser
+      this.applyRemoteVoiceOutput()
       this.startVoiceActivityLoop()
     } catch (err) {
       console.warn('[WebRTC] Falha ao iniciar analyser de voz remota:', err)
@@ -2629,20 +2890,46 @@ export class MsnWebRTCService {
   }
 
   /**
-   * Ajusta o volume da voz do amigo (0% a 200%) diretamente no GainNode unificado do Web Audio API.
-   * Como o mesmo GainNode alimenta tanto a saída de áudio quanto a referência do cancelador de loopback,
-   * o cancelamento da voz no compartilhamento de tela permanece 100% exato em qualquer volume!
+   * Indica se a voz do amigo está saindo pelo Web Audio (boost > 100%). Nesse caso o
+   * <audio id="remote-voice"> deve ficar mutado para não tocar a voz em dobro.
+   */
+  public static isVoiceBoostVolume(volumePercent: number): boolean {
+    return volumePercent > 100
+  }
+
+  /**
+   * Ajusta o volume da voz do amigo (0% a 200%).
+   * Antes o GainNode nunca era conectado a lugar nenhum, então o slider não tinha efeito algum.
+   * Até 100% o volume é aplicado no elemento <audio>; acima disso a voz é roteada pelo GainNode.
    */
   public setRemoteVoiceBoostVolume(volumePercent: number): void {
     this.remoteVoiceVolumePercent = volumePercent
     if (this.audioCtx && this.audioCtx.state === 'suspended') {
       this.audioCtx.resume().catch(() => {})
     }
-    if (!this.remoteVoiceGainNode || !this.audioCtx) return
-    const gainValue = this.inCall
-      ? Math.max(0, Math.min(2, volumePercent / 100))
-      : 0
-    this.remoteVoiceGainNode.gain.setTargetAtTime(gainValue, this.audioCtx.currentTime, 0.02)
+    this.applyRemoteVoiceOutput()
+  }
+
+  private applyRemoteVoiceOutput(): void {
+    const gainNode = this.remoteVoiceGainNode
+    const ctx = this.audioCtx
+    if (!gainNode || !ctx) return
+
+    const boostActive =
+      this.inCall && MsnWebRTCService.isVoiceBoostVolume(this.remoteVoiceVolumePercent)
+    if (boostActive) {
+      const gainValue = Math.max(0, Math.min(2, this.remoteVoiceVolumePercent / 100))
+      gainNode.gain.setTargetAtTime(gainValue, ctx.currentTime, 0.02)
+      if (!this.remoteVoiceBoostConnected) {
+        gainNode.connect(ctx.destination)
+        this.remoteVoiceBoostConnected = true
+      }
+    } else if (this.remoteVoiceBoostConnected) {
+      try {
+        gainNode.disconnect(ctx.destination)
+      } catch {}
+      this.remoteVoiceBoostConnected = false
+    }
   }
 
   /**
@@ -2809,7 +3096,7 @@ export class MsnWebRTCService {
         break
 
       case 'dj-sync':
-        this.callbacks.onDjSync(packet.state)
+        this.callbacks.onDjSync(packet.state, Boolean(packet.initial))
         break
 
       case 'album-ranked':
@@ -2897,7 +3184,8 @@ export class MsnWebRTCService {
           fileSize: packet.fileSize,
           mimeType: packet.mimeType,
           totalChunks: packet.totalChunks,
-          chunks: new Array(packet.totalChunks),
+          // Array denso (não "new Array(n)"): every() pula buracos de arrays esparsos
+          chunks: Array.from({ length: packet.totalChunks }, () => undefined),
           receivedCount: 0
         })
         this.callbacks.onFileProgress({
@@ -2910,14 +3198,20 @@ export class MsnWebRTCService {
       case 'file-chunk': {
         const transfer = this.incomingFiles.get(packet.transferId)
         if (!transfer) break
-        transfer.chunks[packet.chunkIndex] = packet.dataBase64
+        if (packet.chunkIndex < 0 || packet.chunkIndex >= transfer.totalChunks) break
+        if (transfer.chunks[packet.chunkIndex] !== undefined) break
+        // Cada chunk é decodificado isoladamente (o tamanho é múltiplo de 4 em base64)
+        transfer.chunks[packet.chunkIndex] = MsnWebRTCService.base64ToBytes(packet.dataBase64)
+        const prevPercent = Math.round((transfer.receivedCount / transfer.totalChunks) * 100)
         transfer.receivedCount += 1
         const percent = Math.round((transfer.receivedCount / transfer.totalChunks) * 100)
-        this.callbacks.onFileProgress({
-          fileName: transfer.fileName,
-          percent,
-          direction: 'receiving'
-        })
+        if (percent !== prevPercent) {
+          this.callbacks.onFileProgress({
+            fileName: transfer.fileName,
+            percent,
+            direction: 'receiving'
+          })
+        }
         break
       }
 
@@ -2927,13 +3221,26 @@ export class MsnWebRTCService {
         this.incomingFiles.delete(packet.transferId)
         this.callbacks.onFileProgress(null)
 
-        const fullBase64 = transfer.chunks.join('')
-        const byteCharacters = atob(fullBase64)
-        const byteArray = new Uint8Array(byteCharacters.length)
-        for (let i = 0; i < byteCharacters.length; i++) {
-          byteArray[i] = byteCharacters.charCodeAt(i)
+        const timestamp = new Date().toLocaleTimeString('pt-BR', {
+          hour: '2-digit',
+          minute: '2-digit'
+        })
+        const complete =
+          !packet.aborted &&
+          transfer.receivedCount === transfer.totalChunks &&
+          transfer.chunks.every((c) => c !== undefined)
+        if (!complete) {
+          this.callbacks.onChatMessage({
+            id: `file-failed-${packet.transferId}`,
+            sender: transfer.sender,
+            text: `⚠️ A transferência do arquivo "${transfer.fileName}" foi interrompida.`,
+            isSystem: true,
+            timestamp
+          })
+          break
         }
-        const blob = new Blob([byteArray], {
+
+        const blob = new Blob(transfer.chunks as Uint8Array<ArrayBuffer>[], {
           type: transfer.mimeType || 'application/octet-stream'
         })
         const blobUrl = URL.createObjectURL(blob)
@@ -2948,10 +3255,7 @@ export class MsnWebRTCService {
             mimeType: transfer.mimeType,
             blobUrl
           },
-          timestamp: new Date().toLocaleTimeString('pt-BR', {
-            hour: '2-digit',
-            minute: '2-digit'
-          })
+          timestamp
         })
         break
       }
@@ -2995,72 +3299,167 @@ export class MsnWebRTCService {
         timestamp: m.timestamp
       }))
     if (clean.length === 0) return
-    this.sendDataChannelPacket({
-      type: 'chat-history-sync',
-      sender: this.myUser,
-      messages: clean
-    })
+
+    // Uma única mensagem do DataChannel aceita no máximo 256 KB: com prints no histórico o pacote
+    // único estourava esse limite (e o do fallback Realtime) e o sync inteiro falhava. Envia em lotes.
+    const MAX_BATCH_CHARS = 200_000
+    let batch: ChatMessageItem[] = []
+    let batchChars = 0
+    const flush = (): void => {
+      if (batch.length === 0) return
+      this.sendDataChannelPacket({
+        type: 'chat-history-sync',
+        sender: this.myUser,
+        messages: batch
+      })
+      batch = []
+      batchChars = 0
+    }
+    for (const msg of clean) {
+      let item: ChatMessageItem = msg
+      let size = JSON.stringify(item).length
+      if (size > MAX_BATCH_CHARS) {
+        // Imagem antiga grande demais para caber em um pacote: sincroniza só o texto
+        item = { ...msg, imageDataUrl: undefined, text: msg.text || '📸 (imagem)' }
+        size = JSON.stringify(item).length
+      }
+      if (batchChars + size > MAX_BATCH_CHARS) flush()
+      batch.push(item)
+      batchChars += size
+    }
+    flush()
   }
 
   /**
-   * Envia arquivos P2P de qualquer tamanho dividindo em chunks seguros de 48 KB com controle de backpressure
+   * Aguarda um DataChannel aberto, solicitando a conexão P2P se necessário.
+   */
+  private async waitForOpenDataChannel(timeoutMs: number): Promise<RTCDataChannel | null> {
+    if (this.dataChannel?.readyState === 'open') return this.dataChannel
+
+    if (this.myUser === 'Vitinho') {
+      if (!this.inCall) this.ensureChatDataChannel()
+    } else {
+      this.sendSignal('room-sync-request', { inRoom: this.inCall }).catch(() => {})
+    }
+
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline && !this.isDestroyed) {
+      await new Promise((r) => setTimeout(r, 200))
+      // Releitura explícita: o DataChannel pode ter sido trocado durante a espera
+      const current = this.dataChannel as RTCDataChannel | null
+      if (current?.readyState === 'open') return current
+    }
+    return null
+  }
+
+  private async sendWithBackpressure(channel: RTCDataChannel, packet: DataChannelPacket): Promise<void> {
+    const HIGH_WATER_MARK = 4 * 1024 * 1024
+    if (channel.bufferedAmount > HIGH_WATER_MARK) {
+      channel.bufferedAmountLowThreshold = 1024 * 1024
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = (): void => {
+          channel.removeEventListener('bufferedamountlow', onLow)
+          channel.removeEventListener('close', onClose)
+        }
+        const onLow = (): void => {
+          cleanup()
+          resolve()
+        }
+        const onClose = (): void => {
+          cleanup()
+          reject(new Error('A conexão P2P caiu durante a transferência.'))
+        }
+        channel.addEventListener('bufferedamountlow', onLow)
+        channel.addEventListener('close', onClose)
+      })
+    }
+    if (channel.readyState !== 'open' || channel !== this.dataChannel) {
+      throw new Error('A conexão P2P caiu durante a transferência.')
+    }
+    channel.send(JSON.stringify(packet))
+  }
+
+  private static bytesToBase64(bytes: Uint8Array): string {
+    let binary = ''
+    const step = 0x8000
+    for (let i = 0; i < bytes.length; i += step) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + step))
+    }
+    return btoa(binary)
+  }
+
+  private static base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
+    const binary = atob(base64)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i)
+    }
+    return bytes
+  }
+
+  /**
+   * Envia arquivos P2P de qualquer tamanho em chunks de 36 KB (48 KB em base64) com controle real
+   * de backpressure (bufferedAmount). Antes o arquivo inteiro era convertido em base64 na memória e
+   * enviado sem respeitar o buffer: o send() estourava a fila do DataChannel e os chunks se perdiam,
+   * chegando um arquivo corrompido (ou nenhum) do outro lado.
    */
   public async sendFileP2P(file: File): Promise<ChatMessageItem> {
-    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
-      await this.connectDataChannelOnly()
+    const channel = await this.waitForOpenDataChannel(12000)
+    if (!channel) {
+      throw new Error('Conexão P2P indisponível no momento. Tente novamente em alguns segundos.')
     }
 
-    const base64All = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader()
-      reader.onload = () => {
-        const result = reader.result as string
-        const commaIndex = result.indexOf(',')
-        resolve(commaIndex !== -1 ? result.slice(commaIndex + 1) : result)
-      }
-      reader.onerror = () => reject(reader.error)
-      reader.readAsDataURL(file)
-    })
-
-    const chunkSize = 48 * 1024 // 48 KB por pacote
-    const totalChunks = Math.max(1, Math.ceil(base64All.length / chunkSize))
+    // Múltiplo de 3 bytes: cada chunk vira base64 sem padding e pode ser decodificado isoladamente
+    const rawChunkSize = 36 * 1024
+    const totalChunks = Math.max(1, Math.ceil(file.size / rawChunkSize))
     const transferId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
-    this.sendDataChannelPacket({
-      type: 'file-start',
-      transferId,
-      sender: this.myUser,
-      fileName: file.name,
-      fileSize: file.size,
-      mimeType: file.type || 'application/octet-stream',
-      totalChunks
-    })
-
-    for (let idx = 0; idx < totalChunks; idx++) {
-      const slice = base64All.slice(idx * chunkSize, (idx + 1) * chunkSize)
-      this.sendDataChannelPacket({
-        type: 'file-chunk',
+    try {
+      await this.sendWithBackpressure(channel, {
+        type: 'file-start',
         transferId,
-        chunkIndex: idx,
-        dataBase64: slice
-      })
-
-      const percent = Math.round(((idx + 1) / totalChunks) * 100)
-      this.callbacks.onFileProgress({
+        sender: this.myUser,
         fileName: file.name,
-        percent,
-        direction: 'sending'
+        fileSize: file.size,
+        mimeType: file.type || 'application/octet-stream',
+        totalChunks
       })
 
-      if (idx % 6 === 0) {
-        await new Promise((r) => setTimeout(r, 8))
-      }
-    }
+      let lastPercent = -1
+      for (let idx = 0; idx < totalChunks; idx++) {
+        const buffer = await file.slice(idx * rawChunkSize, (idx + 1) * rawChunkSize).arrayBuffer()
+        await this.sendWithBackpressure(channel, {
+          type: 'file-chunk',
+          transferId,
+          chunkIndex: idx,
+          dataBase64: MsnWebRTCService.bytesToBase64(new Uint8Array(buffer))
+        })
 
-    this.sendDataChannelPacket({
-      type: 'file-end',
-      transferId
-    })
-    this.callbacks.onFileProgress(null)
+        const percent = Math.round(((idx + 1) / totalChunks) * 100)
+        if (percent !== lastPercent) {
+          lastPercent = percent
+          this.callbacks.onFileProgress({
+            fileName: file.name,
+            percent,
+            direction: 'sending'
+          })
+        }
+      }
+
+      await this.sendWithBackpressure(channel, {
+        type: 'file-end',
+        transferId
+      })
+    } catch (err) {
+      try {
+        if (channel.readyState === 'open') {
+          channel.send(JSON.stringify({ type: 'file-end', transferId, aborted: true }))
+        }
+      } catch {}
+      throw err
+    } finally {
+      this.callbacks.onFileProgress(null)
+    }
 
     const localBlobUrl = URL.createObjectURL(file)
     return {
@@ -3128,10 +3527,11 @@ export class MsnWebRTCService {
     this.trackPresenceState()
   }
 
-  public sendDjSync(state: DjSyncState): void {
+  public sendDjSync(state: DjSyncState, initial = false): void {
     this.sendDataChannelPacket({
       type: 'dj-sync',
-      state
+      state,
+      initial
     })
   }
 
@@ -3210,6 +3610,17 @@ export class MsnWebRTCService {
   }
 
   public destroy(): void {
+    // Avisa o amigo que saí da sala (logout/fechar o app durante a ligação); antes ele só
+    // percebia pela queda de presença, segundos depois.
+    if (this.inCall && !this.isDestroyed) {
+      this.sendDataChannelPacket({
+        type: 'room-state',
+        sender: this.myUser,
+        inRoom: false
+      })
+      this.sendSignal('hangup', { inRoom: false }).catch(() => {})
+      this.inCall = false
+    }
     this.isDestroyed = true
     if (this.offlineGraceTimeout) {
       clearTimeout(this.offlineGraceTimeout)
@@ -3219,7 +3630,10 @@ export class MsnWebRTCService {
       clearTimeout(this.realtimeReconnectTimeout)
       this.realtimeReconnectTimeout = null
     }
-    if (this.vadInterval) clearInterval(this.vadInterval)
+    if (this.vadInterval) {
+      clearInterval(this.vadInterval)
+      this.vadInterval = null
+    }
     if (this.silenceTimeout) clearTimeout(this.silenceTimeout)
     if (this.disconnectGraceTimer) clearTimeout(this.disconnectGraceTimer)
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
@@ -3242,16 +3656,19 @@ export class MsnWebRTCService {
       this.visibilityHandler = null
     }
     this.cleanupMediaStreams()
-    this.dataChannel?.close()
     this.resetPeerConnection()
-    try {
-      this.realtimeChannel?.untrack()
-    } catch {}
-    try {
-      if (this.realtimeChannel && this.supabase) {
-        this.supabase.removeChannel(this.realtimeChannel)
-      }
-    } catch {}
+    this.realtimeGeneration++
+    const channel = this.realtimeChannel
     this.realtimeChannel = null
+    if (channel) {
+      channel.untrack().catch(() => {})
+      this.supabase?.removeChannel(channel).catch(() => {})
+    }
+    // Libera o AudioContext (antes ficava vivo após logout/destroy, um por sessão)
+    if (this.audioCtx) {
+      this.audioCtx.close().catch(() => {})
+      this.audioCtx = null
+      this.workletRegistered = false
+    }
   }
 }

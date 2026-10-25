@@ -82,6 +82,49 @@ const AVATAR_WILL =
     <text x="60" y="114" font-family="Tahoma" font-size="11" font-weight="bold" fill="#86efac" text-anchor="middle">WILL</text>
   </svg>`)
 
+// Uma mensagem do RTCDataChannel aceita no máximo 256 KB (e o fallback Realtime também tem limite).
+// Prints colados em PNG passam disso facilmente, então são reduzidos/convertidos para JPEG antes do envio.
+const MAX_CHAT_IMAGE_DATA_URL_LENGTH = 180_000
+
+async function compressImageForChat(dataUrl: string): Promise<string> {
+  if (dataUrl.length <= MAX_CHAT_IMAGE_DATA_URL_LENGTH) return dataUrl
+
+  const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const el = new Image()
+    el.onload = () => resolve(el)
+    el.onerror = () => reject(new Error('Imagem inválida'))
+    el.src = dataUrl
+  })
+
+  let scale = Math.min(1, 1600 / Math.max(img.width, img.height))
+  let quality = 0.85
+  let result = dataUrl
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.max(1, Math.round(img.width * scale))
+    canvas.height = Math.max(1, Math.round(img.height * scale))
+    const ctx = canvas.getContext('2d')
+    if (!ctx) break
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+    result = canvas.toDataURL('image/jpeg', quality)
+    if (result.length <= MAX_CHAT_IMAGE_DATA_URL_LENGTH) return result
+    if (quality > 0.55) {
+      quality -= 0.15
+    } else {
+      scale *= 0.75
+    }
+  }
+  return result
+}
+
+const nowTimeLabel = (): string =>
+  new Date().toLocaleTimeString('pt-BR', {
+    hour: '2-digit',
+    minute: '2-digit'
+  })
+
 export function App(): React.ReactElement {
   // Se a rota for #/album-ranker, renderiza a TELA 6 (Segunda Janela Dedicada do Rankeador de Álbuns)
   const [routeHash, setRouteHash] = useState<string>(window.location.hash)
@@ -203,6 +246,9 @@ const MainMsnMessengerWindow: React.FC = () => {
     updatedBy: 'Vitinho',
     updatedAt: Date.now()
   })
+
+  const djStateRef = useRef<DjSyncState>(djState)
+  djStateRef.current = djState
 
   // Referências de Mídia e Serviço WebRTC
   const webrtcRef = useRef<MsnWebRTCService | null>(null)
@@ -382,10 +428,12 @@ const MainMsnMessengerWindow: React.FC = () => {
   const syncMediaElementsWithVisibility = useCallback(() => {
     const st = streamsRef.current
 
-    // O <audio id="remote-voice"> reproduz diretamente a voz do amigo com estabilidade absoluta e latência zero
+    // O <audio id="remote-voice"> reproduz diretamente a voz do amigo de 0% a 100%.
+    // Acima de 100% (boost) a voz sai pelo Web Audio do serviço e o elemento fica mutado.
     if (remoteVoiceAudioRef.current) {
-      remoteVoiceAudioRef.current.muted = !inCall
-      remoteVoiceAudioRef.current.volume = 1.0
+      remoteVoiceAudioRef.current.muted =
+        !inCall || MsnWebRTCService.isVoiceBoostVolume(friendVoiceVolume)
+      remoteVoiceAudioRef.current.volume = Math.max(0, Math.min(1, friendVoiceVolume / 100))
       if (remoteVoiceAudioRef.current.srcObject !== st.remoteVoice) {
         remoteVoiceAudioRef.current.srcObject = st.remoteVoice
       }
@@ -471,7 +519,20 @@ const MainMsnMessengerWindow: React.FC = () => {
         }
       }
     }
-  }, [isWindowVisible, inCall, isScreenSharing, remoteScreenSharing, djState.isPlaying, screenMovieVolume])
+  }, [
+    isWindowVisible,
+    inCall,
+    isScreenSharing,
+    remoteScreenSharing,
+    djState.isPlaying,
+    screenMovieVolume,
+    friendVoiceVolume
+  ])
+
+  // Os callbacks do serviço WebRTC são criados uma única vez por login; eles precisam chamar
+  // sempre a versão mais recente da função (com inCall/isScreenSharing atuais), não a do 1º render.
+  const syncMediaElementsRef = useRef(syncMediaElementsWithVisibility)
+  syncMediaElementsRef.current = syncMediaElementsWithVisibility
 
   const bindLocalCamRef = useCallback(
     (el: HTMLVideoElement | null) => {
@@ -548,6 +609,15 @@ const MainMsnMessengerWindow: React.FC = () => {
     webrtcRef.current?.setRemoteVoiceBoostVolume(friendVoiceVolume)
   }, [friendVoiceVolume, inCall])
 
+  // Ao sair da sala o microfone e a câmera são liberados; na próxima entrada eles voltam ativos.
+  // Sem isso a UI continuava mostrando "mutado"/"câmera desligada" com o mic/câmera novos ligados.
+  useEffect(() => {
+    if (!inCall) {
+      setIsMicMuted(false)
+      setIsCamEnabled(true)
+    }
+  }, [inCall])
+
   // Sai automaticamente da Tela Cheia quando a ligação é encerrada, e suporta tecla Esc / F11 na chamada
   useEffect(() => {
     if (!inCall && isCallFullscreen) {
@@ -611,6 +681,11 @@ const MainMsnMessengerWindow: React.FC = () => {
         if (messagesRef.current.length > 0) {
           service.sendChatHistorySync(messagesRef.current)
         }
+        // Quem entra depois recebe a fila atual do DJ Bot; antes ele começava com a fila vazia e,
+        // ao adicionar uma música, sobrescrevia a playlist inteira do amigo.
+        if (djStateRef.current.playlist.length > 0) {
+          service.sendDjSync(djStateRef.current, true)
+        }
       },
       onNudgeReceived: (sender) => {
         soundManager.play('nudge')
@@ -645,8 +720,14 @@ const MainMsnMessengerWindow: React.FC = () => {
           }
         ])
       },
-      onDjSync: (state) => {
-        setDjState(state)
+      onDjSync: (state, initial) => {
+        setDjState((prev) => {
+          // No sync inicial (reconexão), mantém a fila local se ela for mais recente que a recebida
+          if (initial && prev.playlist.length > 0 && prev.updatedAt >= state.updatedAt) {
+            return prev
+          }
+          return state
+        })
       },
       onAlbumRankedNotification: (payload) => {
         soundManager.play('message')
@@ -723,7 +804,7 @@ const MainMsnMessengerWindow: React.FC = () => {
         streamsRef.current = streams
         setHasLocalCam(Boolean(streams.localCam && streams.localCam.getVideoTracks().length > 0))
         setHasRemoteCam(Boolean(streams.remoteCam && streams.remoteCam.getVideoTracks().length > 0))
-        syncMediaElementsWithVisibility()
+        syncMediaElementsRef.current()
       },
       onVoiceActivityChange: (speaking) => {
         setIsAnyoneSpeaking(speaking)
@@ -894,8 +975,13 @@ const MainMsnMessengerWindow: React.FC = () => {
         const blob = item.getAsFile()
         if (!blob) continue
         const reader = new FileReader()
-        reader.onload = () => {
-          const dataUrl = reader.result as string
+        reader.onload = async () => {
+          let dataUrl = reader.result as string
+          try {
+            dataUrl = await compressImageForChat(dataUrl)
+          } catch (err) {
+            console.warn('[Chat] Falha ao comprimir print colado:', err)
+          }
           const sent = webrtcRef.current?.sendChatMessage(
             '📸 Print colado da área de transferência:',
             dataUrl
@@ -908,14 +994,47 @@ const MainMsnMessengerWindow: React.FC = () => {
     }
   }
 
+  const appendSystemMessage = (text: string): void => {
+    if (!loggedInUser) return
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        sender: loggedInUser,
+        text,
+        isSystem: true,
+        timestamp: nowTimeLabel()
+      }
+    ])
+  }
+
   // Envio P2P de Arquivos sem limite de tamanho (Drag-and-Drop ou seletor)
   const handleFilesSelected = async (files: FileList | null): Promise<void> => {
     if (!files || files.length === 0 || !webrtcRef.current) return
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i]
-      const msg = await webrtcRef.current.sendFileP2P(file)
-      setMessages((prev) => [...prev, msg])
+    // Copia antes do await: o FileList do <input> é esvaziado quando o value é resetado
+    const list = Array.from(files)
+    if (fileInputRef.current) fileInputRef.current.value = ''
+    for (const file of list) {
+      const service = webrtcRef.current
+      if (!service) return
+      try {
+        const msg = await service.sendFileP2P(file)
+        setMessages((prev) => [...prev, msg])
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : 'erro desconhecido'
+        appendSystemMessage(`⚠️ Não foi possível enviar "${file.name}": ${reason}`)
+      }
     }
+  }
+
+  const handleStartScreenShare = (sourceId: string, includeAudio: boolean): void => {
+    setScreenModalOpen(false)
+    webrtcRef.current?.startScreenShare(sourceId, includeAudio).catch((err) => {
+      console.warn('[ScreenShare] Falha ao iniciar compartilhamento:', err)
+      appendSystemMessage(
+        '⚠️ Não foi possível iniciar o compartilhamento de tela (a janela pode ter sido fechada). Tente novamente.'
+      )
+    })
   }
 
   // Chamar Atenção (Nudge): toca nudge.mp3 + treme a janela física do Electron por 600ms com cooldown de 5s
@@ -1227,10 +1346,7 @@ const MainMsnMessengerWindow: React.FC = () => {
       <ScreenShareModal
         isOpen={screenModalOpen}
         onClose={() => setScreenModalOpen(false)}
-        onSelectSource={(sourceId, includeAudio) => {
-          setScreenModalOpen(false)
-          webrtcRef.current?.startScreenShare(sourceId, includeAudio)
-        }}
+        onSelectSource={handleStartScreenShare}
       />
 
       {/* MODAL DE CONFIGURAÇÃO DE MICROFONE E WEBCAM */}
@@ -1461,7 +1577,7 @@ const MainMsnMessengerWindow: React.FC = () => {
             type="button"
             onClick={() => {
               if (isScreenSharing) {
-                webrtcRef.current?.stopScreenShare()
+                webrtcRef.current?.stopScreenShare().catch(() => {})
               } else {
                 setRoomViewActive(true)
                 setScreenModalOpen(true)
@@ -1855,7 +1971,7 @@ const MainMsnMessengerWindow: React.FC = () => {
                     <button
                       type="button"
                       onClick={() => {
-                        webrtcRef.current?.stopScreenShare()
+                        webrtcRef.current?.stopScreenShare().catch(() => {})
                       }}
                       className="px-3.5 py-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-lg"
                       title="Parar de transmitir sua tela"

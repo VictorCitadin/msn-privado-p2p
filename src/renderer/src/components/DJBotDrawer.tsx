@@ -45,6 +45,8 @@ export const DJBotDrawer: React.FC<DJBotDrawerProps> = ({
 
   const djStateRef = useRef<DjSyncState>(djState)
   djStateRef.current = djState
+  const progressSecRef = useRef<number>(progressSec)
+  progressSecRef.current = progressSec
   const endedLockRef = useRef<string | null>(null)
 
   const currentTrack: DjTrackItem | null =
@@ -139,13 +141,16 @@ export const DJBotDrawer: React.FC<DJBotDrawerProps> = ({
         addedBy: currentUser
       }
 
-      const nextPlaylist = [...djState.playlist, newTrack]
-      const shouldStartNow = djState.playlist.length === 0
+      // Lê o estado atual (não o da closure): a busca leva alguns segundos e o amigo pode ter
+      // alterado a fila nesse meio tempo, e a música dele seria apagada.
+      const latest = djStateRef.current
+      const nextPlaylist = [...latest.playlist, newTrack]
+      const shouldStartNow = latest.playlist.length === 0
       const nextState: DjSyncState = {
         playlist: nextPlaylist,
-        currentIndex: shouldStartNow ? 0 : djState.currentIndex,
-        isPlaying: shouldStartNow ? true : djState.isPlaying,
-        currentTime: shouldStartNow ? 0 : progressSec,
+        currentIndex: shouldStartNow ? 0 : latest.currentIndex,
+        isPlaying: shouldStartNow ? true : latest.isPlaying,
+        currentTime: shouldStartNow ? 0 : progressSecRef.current,
         updatedBy: currentUser,
         updatedAt: Date.now()
       }

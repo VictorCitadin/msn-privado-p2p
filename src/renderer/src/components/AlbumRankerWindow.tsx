@@ -178,10 +178,28 @@ export const AlbumRankerWindow: React.FC = () => {
   const previewAudioRef = useRef<HTMLAudioElement | null>(null)
   const [toastBanner, setToastBanner] = useState<string | null>(null)
 
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const showToast = (msg: string): void => {
     setToastBanner(msg)
-    setTimeout(() => setToastBanner(null), 4000)
+    // Reinicia o timer: senão o timeout de um toast anterior apagava o novo antes da hora
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    toastTimerRef.current = setTimeout(() => setToastBanner(null), 4000)
   }
+
+  const stopTrackPreview = (): void => {
+    if (previewAudioRef.current) {
+      previewAudioRef.current.pause()
+      previewAudioRef.current = null
+    }
+    setPlayingPreviewTrackId(null)
+  }
+
+  // O preview de 30s continuava tocando ao sair da tela de edição (voltar/trocar álbum)
+  useEffect(() => {
+    if (subView !== 'create-edit' || !editingAlbum) {
+      stopTrackPreview()
+    }
+  }, [subView, editingAlbum])
 
   const loadInitialData = async (): Promise<void> => {
     setLoadingRankings(true)
@@ -311,6 +329,7 @@ export const AlbumRankerWindow: React.FC = () => {
       setSubView('create-edit')
     } catch (err) {
       console.error('[AlbumRanker] Erro ao carregar faixas do álbum:', err)
+      showToast('⚠️ Não foi possível carregar as faixas deste álbum.')
     } finally {
       setIsLoadingAlbumTracks(false)
     }
@@ -349,6 +368,7 @@ export const AlbumRankerWindow: React.FC = () => {
       showToast(`🏆 Ranking de "${editingAlbum.albumName}" salvo e sincronizado com sucesso!`)
     } catch (err) {
       console.error('[AlbumRanker] Erro ao salvar ranking:', err)
+      showToast('⚠️ Não foi possível salvar o ranking. Tente novamente.')
     } finally {
       setIsSaving(false)
     }

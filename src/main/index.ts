@@ -11,7 +11,7 @@ import {
   Notification,
   session
 } from 'electron'
-import { join, extname } from 'path'
+import { join, extname, resolve as resolvePath, sep } from 'path'
 import os from 'os'
 import { createServer, Server as HttpServer } from 'http'
 import { existsSync, copyFileSync } from 'fs'
@@ -151,7 +151,7 @@ let localHttpServer: HttpServer | null = null
 async function ensureLocalRendererServer(): Promise<string> {
   if (localRendererServerUrl) return localRendererServerUrl
 
-  const rendererRoot = join(__dirname, '../renderer')
+  const rendererRoot = resolvePath(__dirname, '../renderer')
   const mimeTypes: Record<string, string> = {
     '.html': 'text/html; charset=utf-8',
     '.js': 'application/javascript; charset=utf-8',
@@ -168,9 +168,15 @@ async function ensureLocalRendererServer(): Promise<string> {
   return new Promise((resolve, reject) => {
     const server = createServer(async (req, res) => {
       try {
-        const cleanUrl = (req.url || '/').split('?')[0].split('#')[0]
+        const cleanUrl = decodeURIComponent((req.url || '/').split('?')[0].split('#')[0])
         const relPath = cleanUrl === '/' ? '/index.html' : cleanUrl
-        const filePath = join(rendererRoot, relPath)
+        const filePath = resolvePath(rendererRoot, '.' + relPath)
+        // Impede path traversal (ex: /../../arquivo) de ler arquivos fora da pasta do renderer
+        if (filePath !== rendererRoot && !filePath.startsWith(rendererRoot + sep)) {
+          res.writeHead(403)
+          res.end('Forbidden')
+          return
+        }
         const data = await readFile(filePath)
         const ext = extname(filePath).toLowerCase()
         res.writeHead(200, {
@@ -388,7 +394,9 @@ function ensureDjPlayerWindow(): BrowserWindow {
     djProgressTimer = setInterval(async () => {
       if (!djPlayerWindow || djPlayerWindow.isDestroyed() || !djTargetState.videoId) return
       try {
-        const shouldSeek = djTargetState.lastSeekTimestamp > djAppliedSeekTimestamp
+        // Compara por diferença (não por ">") porque o timestamp pode vir do relógio do amigo,
+        // que pode estar atrasado em relação ao meu e faria o seek ser ignorado.
+        const shouldSeek = djTargetState.lastSeekTimestamp !== djAppliedSeekTimestamp
         const seekVal = djTargetState.seekSeconds
         if (shouldSeek) {
           djAppliedSeekTimestamp = djTargetState.lastSeekTimestamp
@@ -568,7 +576,9 @@ async function createMainWindow(): Promise<void> {
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
+    if (/^https?:\/\//i.test(details.url)) {
+      shell.openExternal(details.url)
+    }
     return { action: 'deny' }
   })
 
@@ -953,6 +963,37 @@ async function resolveDjBotTrack(queryOrUrl: string): Promise<{
   }
 }
 
+/**
+ * Mescla o registro local (electron-store) com o da nuvem preservando, para cada amigo,
+ * o voto mais recente. Sem isso, um ranking salvo offline era sobrescrito pela versão
+ * antiga do Supabase na próxima listagem.
+ */
+function mergeRankingRecords(
+  local: AlbumRankingRecord | undefined,
+  remote: AlbumRankingRecord
+): AlbumRankingRecord {
+  if (!local) return remote
+  const time = (iso?: string | null): number => (iso ? new Date(iso).getTime() || 0 : 0)
+  const merged: AlbumRankingRecord = { ...remote }
+
+  if (time(local.vitinho_ranked_at) > time(remote.vitinho_ranked_at)) {
+    merged.vitinho_rating = local.vitinho_rating
+    merged.vitinho_comment = local.vitinho_comment
+    merged.vitinho_track_order = local.vitinho_track_order
+    merged.vitinho_ranked_at = local.vitinho_ranked_at
+  }
+  if (time(local.will_ranked_at) > time(remote.will_ranked_at)) {
+    merged.will_rating = local.will_rating
+    merged.will_comment = local.will_comment
+    merged.will_track_order = local.will_track_order
+    merged.will_ranked_at = local.will_ranked_at
+  }
+  if (time(local.updated_at) > time(remote.updated_at)) {
+    merged.updated_at = local.updated_at
+  }
+  return merged
+}
+
 // ============================================================================
 // 10. HANDLERS IPC E AUTO-UPDATER
 // ============================================================================
@@ -1149,7 +1190,7 @@ function registerIpcHandlers(): void {
         if (Array.isArray(data)) {
           const mergedMap: Record<string, AlbumRankingRecord> = { ...localMap }
           for (const row of data) {
-            mergedMap[row.album_id] = row
+            mergedMap[row.album_id] = mergeRankingRecords(localMap[row.album_id], row)
           }
           store.set('albumRankings', mergedMap)
           return Object.values(mergedMap).sort((a, b) =>
@@ -1418,6 +1459,15 @@ function registerIpcHandlers(): void {
             }
           }, 3500)
 
+          // Se o processo morrer antes do handshake, falha na hora em vez de esperar o timeout
+          child.once('exit', () => {
+            if (!settled) {
+              settled = true
+              clearTimeout(timeout)
+              resolve(false)
+            }
+          })
+
           child.stderr.on('data', (data: Buffer) => {
             const msg = data.toString('utf8')
             console.log('[Loopback STDERR]', msg)
@@ -1555,16 +1605,18 @@ app.on('before-quit', (e) => {
     e.preventDefault()
     isQuitting = true
     mainWindow.webContents.send('app:before-quit')
+    const onCleanupDone = (): void => {
+      clearTimeout(forceQuitTimer)
+      stopLoopbackProcess()
+      app.quit()
+    }
     const forceQuitTimer = setTimeout(() => {
+      ipcMain.removeListener('app:before-quit-done', onCleanupDone)
       stopLoopbackProcess()
       app.quit()
     }, 800)
 
-    ipcMain.once('app:before-quit-done', () => {
-      clearTimeout(forceQuitTimer)
-      stopLoopbackProcess()
-      app.quit()
-    })
+    ipcMain.once('app:before-quit-done', onCleanupDone)
   } else {
     isQuitting = true
     stopLoopbackProcess()
