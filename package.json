@@ -1,6 +1,6 @@
 {
   "name": "msn-privado-p2p",
-  "version": "1.0.16",
+  "version": "1.0.17",
   "description": "Vitinho e Will — Messenger Privado P2P + DJ Bot + Album Ranker",
   "main": "./out/main/index.js",
   "author": "Vitinho & Will",
