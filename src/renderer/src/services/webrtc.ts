@@ -843,12 +843,9 @@ export class MsnWebRTCService {
         ? streams[0].id
         : this.remoteTrackStreamIds.get(track.id) || null
 
-    const audioTransceivers = this.peerConnection
-      .getTransceivers()
-      .filter((t) => t.receiver.track?.kind === 'audio')
-    const videoTransceivers = this.peerConnection
-      .getTransceivers()
-      .filter((t) => t.receiver.track?.kind === 'video')
+    const receiving = this.getReceivingTransceivers()
+    const audioTransceivers = receiving.filter((t) => t.receiver.track?.kind === 'audio')
+    const videoTransceivers = receiving.filter((t) => t.receiver.track?.kind === 'video')
 
     if (track.kind === 'audio') {
       let isScreenAudio = false
@@ -952,10 +949,24 @@ export class MsnWebRTCService {
     this.emitCallState()
   }
 
+  /**
+   * Transceivers pelos quais o amigo realmente envia mídia para mim. Os que eu criei só para
+   * enviar (ex: os da minha tela compartilhada) também têm um receiver com uma trilha "viva",
+   * porém vazia/mutada: tratá-la como trilha do amigo deixava a câmera dele preta e a voz muda
+   * assim que eu começava a compartilhar a tela.
+   */
+  private getReceivingTransceivers(): RTCRtpTransceiver[] {
+    if (!this.peerConnection) return []
+    return this.peerConnection.getTransceivers().filter((t) => {
+      const dir = t.currentDirection
+      return dir === 'sendrecv' || dir === 'recvonly'
+    })
+  }
+
   private syncRemoteStreamsFromReceivers(): void {
     if (!this.peerConnection) return
-    for (const receiver of this.peerConnection.getReceivers()) {
-      const track = receiver.track
+    for (const transceiver of this.getReceivingTransceivers()) {
+      const track = transceiver.receiver.track
       if (track && track.readyState === 'live') {
         this.routeRemoteTrack(track)
       }

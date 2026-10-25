@@ -1394,14 +1394,23 @@ function registerIpcHandlers(): void {
       }
 
       const exeName = 'loopback-capture.exe'
-      const possiblePaths = [
-        join(app.getAppPath(), 'resources', exeName),
-        join(process.resourcesPath, exeName),
-        join(process.resourcesPath, 'resources', exeName),
-        join(__dirname, '../../resources', exeName),
-        join(__dirname, '../resources', exeName)
-      ]
-      const exePath = possiblePaths.find((p) => existsSync(p))
+      // No app instalado, caminhos dentro do app.asar "existem" para o fs do Electron, mas o spawn()
+      // não consegue executá-los (ENOENT). Antes o primeiro candidato era justamente
+      // app.asar\resources\loopback-capture.exe: a captura nativa sempre falhava e o áudio caía no
+      // loopback do Chromium, que grava o sistema inteiro (incluindo a voz do amigo).
+      const possiblePaths = app.isPackaged
+        ? [
+            join(process.resourcesPath, 'resources', exeName),
+            join(process.resourcesPath, 'app.asar.unpacked', 'resources', exeName),
+            join(process.resourcesPath, exeName)
+          ]
+        : [
+            join(app.getAppPath(), 'resources', exeName),
+            join(__dirname, '../../resources', exeName)
+          ]
+      const exePath = possiblePaths.find(
+        (p) => existsSync(p) && !/app\.asar[\\/]/i.test(p)
+      )
       if (!exePath) {
         console.warn(
           '[Loopback] Executável loopback-capture.exe não encontrado nos caminhos:',
@@ -1459,14 +1468,16 @@ function registerIpcHandlers(): void {
             }
           }, 3500)
 
-          // Se o processo morrer antes do handshake, falha na hora em vez de esperar o timeout
-          child.once('exit', () => {
+          // Se o processo morrer (ou nem iniciar) antes do handshake, falha na hora em vez de esperar o timeout
+          const failFast = (): void => {
             if (!settled) {
               settled = true
               clearTimeout(timeout)
               resolve(false)
             }
-          })
+          }
+          child.once('exit', failFast)
+          child.once('error', failFast)
 
           child.stderr.on('data', (data: Buffer) => {
             const msg = data.toString('utf8')
