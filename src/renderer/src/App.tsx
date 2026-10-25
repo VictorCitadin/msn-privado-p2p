@@ -388,6 +388,8 @@ const MainMsnMessengerWindow: React.FC = () => {
       remoteVoiceAudioRef.current.volume = 1.0
       if (remoteVoiceAudioRef.current.srcObject !== st.remoteVoice) {
         remoteVoiceAudioRef.current.srcObject = st.remoteVoice
+      }
+      if (inCall && st.remoteVoice && remoteVoiceAudioRef.current.paused) {
         remoteVoiceAudioRef.current.play().catch(() => {})
       }
     }
@@ -407,6 +409,8 @@ const MainMsnMessengerWindow: React.FC = () => {
           : Math.max(0, Math.min(1, screenMovieVolume / 100))
         if (remoteScreenAudioRef.current.srcObject !== screenAudioStream) {
           remoteScreenAudioRef.current.srcObject = screenAudioStream
+        }
+        if (remoteScreenAudioRef.current.paused) {
           remoteScreenAudioRef.current.play().catch(() => {})
         }
       } else {
@@ -1744,8 +1748,8 @@ const MainMsnMessengerWindow: React.FC = () => {
 
                   <button
                     type="button"
-                    onClick={() => {
-                      const enabled = webrtcRef.current?.toggleCameraEnabled() ?? true
+                    onClick={async () => {
+                      const enabled = (await webrtcRef.current?.toggleCameraEnabled()) ?? true
                       setIsCamEnabled(enabled)
                     }}
                     className={`p-2.5 rounded-xl border ${
@@ -1992,8 +1996,8 @@ const MainMsnMessengerWindow: React.FC = () => {
 
                 <button
                   type="button"
-                  onClick={() => {
-                    const enabled = webrtcRef.current?.toggleCameraEnabled() ?? true
+                  onClick={async () => {
+                    const enabled = (await webrtcRef.current?.toggleCameraEnabled()) ?? true
                     setIsCamEnabled(enabled)
                   }}
                   className={`p-2.5 rounded-xl border ${

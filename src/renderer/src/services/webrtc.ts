@@ -1074,7 +1074,9 @@ export class MsnWebRTCService {
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true,
-            ...(audioDeviceId ? { deviceId: { exact: audioDeviceId } } : {})
+            ...(audioDeviceId && audioDeviceId !== 'default'
+              ? { deviceId: { exact: audioDeviceId } }
+              : {})
           },
           video: false
         })
@@ -1112,7 +1114,9 @@ export class MsnWebRTCService {
             width: { ideal: 1280 },
             height: { ideal: 720 },
             frameRate: { ideal: 30 },
-            ...(videoDeviceId ? { deviceId: { exact: videoDeviceId } } : {})
+            ...(videoDeviceId && videoDeviceId !== 'default'
+              ? { deviceId: { exact: videoDeviceId } }
+              : {})
           },
           audio: false
         })
@@ -1313,7 +1317,11 @@ export class MsnWebRTCService {
     this.resetPeerConnection()
     this.trackPresenceState()
     if (this.myUser === 'Vitinho') {
-      this.connectDataChannelOnly().catch(() => {})
+      if (this.friendInRoom) {
+        this.connectReceiveOnlyCall().catch(() => {})
+      } else {
+        this.connectDataChannelOnly().catch(() => {})
+      }
     }
     this.emitStreamsUpdated()
     this.emitCallState()
@@ -1527,7 +1535,18 @@ export class MsnWebRTCService {
     return audioTrack ? !audioTrack.enabled : false
   }
 
-  public toggleCameraEnabled(): boolean {
+  public async toggleCameraEnabled(): Promise<boolean> {
+    if (!this.localCamStream) {
+      await this.acquireMicAndCam(true)
+      const currentCamStream = this.localCamStream as MediaStream | null
+      if (this.peerConnection && currentCamStream) {
+        this.attachLocalStreamsToPeer(this.peerConnection)
+        await this.ensureTransceiversSendRecv(this.peerConnection)
+        await this.renegotiatePeerConnection()
+      }
+      this.emitStreamsUpdated()
+      return Boolean(currentCamStream?.getVideoTracks()[0]?.enabled)
+    }
     const videoTrack = this.localCamStream?.getVideoTracks()[0]
     if (!videoTrack) return false
     videoTrack.enabled = !videoTrack.enabled
@@ -1971,6 +1990,11 @@ export class MsnWebRTCService {
         return
       }
 
+      if (offerCollision && this.isPolite) {
+        console.log('[WebRTC] Colisão de ofertas no polite peer: executando rollback para aceitar oferta remota...')
+        await pc.setLocalDescription({ type: 'rollback' })
+      }
+
       if (this.inCall) {
         await this.acquireMicAndCam(Boolean(this.localCamStream)).catch(() => {})
         this.attachLocalStreamsToPeer(pc)
@@ -2073,7 +2097,7 @@ export class MsnWebRTCService {
         camStreamId: null,
         screenStreamId: null
       }
-      if (this.myUser === 'Vitinho' && (!this.dataChannel || this.dataChannel.readyState !== 'open')) {
+      if (!this.inCall && this.myUser === 'Vitinho' && (!this.dataChannel || this.dataChannel.readyState !== 'open')) {
         this.connectDataChannelOnly().catch(() => {})
       }
       this.emitStreamsUpdated()
@@ -2864,11 +2888,10 @@ export class MsnWebRTCService {
 
         const fullBase64 = transfer.chunks.join('')
         const byteCharacters = atob(fullBase64)
-        const byteNumbers = new Array(byteCharacters.length)
+        const byteArray = new Uint8Array(byteCharacters.length)
         for (let i = 0; i < byteCharacters.length; i++) {
-          byteNumbers[i] = byteCharacters.charCodeAt(i)
+          byteArray[i] = byteCharacters.charCodeAt(i)
         }
-        const byteArray = new Uint8Array(byteNumbers)
         const blob = new Blob([byteArray], {
           type: transfer.mimeType || 'application/octet-stream'
         })
@@ -2946,13 +2969,16 @@ export class MsnWebRTCService {
       await this.connectDataChannelOnly()
     }
 
-    const arrayBuffer = await file.arrayBuffer()
-    const bytes = new Uint8Array(arrayBuffer)
-    let binary = ''
-    for (let i = 0; i < bytes.byteLength; i++) {
-      binary += String.fromCharCode(bytes[i])
-    }
-    const base64All = btoa(binary)
+    const base64All = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => {
+        const result = reader.result as string
+        const commaIndex = result.indexOf(',')
+        resolve(commaIndex !== -1 ? result.slice(commaIndex + 1) : result)
+      }
+      reader.onerror = () => reject(reader.error)
+      reader.readAsDataURL(file)
+    })
 
     const chunkSize = 48 * 1024 // 48 KB por pacote
     const totalChunks = Math.max(1, Math.ceil(base64All.length / chunkSize))
