@@ -38,14 +38,6 @@ export interface DjSyncState {
   updatedAt: number
 }
 
-export interface LaserPointerPoint {
-  id: string
-  x: number // 0..1 relativo ao vídeo
-  y: number // 0..1 relativo ao vídeo
-  sender: MsnUser
-  createdAt: number
-}
-
 export type DataChannelPacket =
   | {
       type: 'chat-message'
@@ -59,12 +51,6 @@ export type DataChannelPacket =
       type: 'nudge'
       sender: MsnUser
       timestamp: string
-    }
-  | {
-      type: 'laser-pointer'
-      sender: MsnUser
-      x: number
-      y: number
     }
   | {
       type: 'soundboard-wink'
@@ -165,7 +151,6 @@ export interface WebRTCCallbacks {
   onChatHistorySync?: (messages: ChatMessageItem[]) => void
   onDataChannelOpen?: () => void
   onNudgeReceived: (sender: MsnUser) => void
-  onLaserPointer?: (point: LaserPointerPoint) => void
   onSoundboardWink: (sender: MsnUser, winkId: SoundboardWinkId, label: string) => void
   onDjSync: (state: DjSyncState) => void
   onAlbumRankedNotification: (payload: {
@@ -431,10 +416,13 @@ export class MsnWebRTCService {
                 this.friendInRoom = latest.inRoom
                 if (latest.inRoom) {
                   this.friendJoinedThisCall = true
-                } else if (wasInRoom && this.inCall && this.friendJoinedThisCall) {
+                } else if (wasInRoom) {
                   this.friendJoinedThisCall = false
-                  this.handleCallDead('O amigo saiu da sala.')
-                  return
+                  this.remoteCamStream = null
+                  this.remoteVoiceStream = null
+                  this.remoteScreenStream = null
+                  this.emitStreamsUpdated()
+                  console.log('[WebRTC] Amigo saiu da sala (presença).')
                 }
                 this.emitCallState()
               }
@@ -449,6 +437,16 @@ export class MsnWebRTCService {
                   } else {
                     console.log('[WebRTC] Ambos na Sala e conexão inexistente: Will solicitando oferta...')
                     this.sendSignal('room-sync-request', { inRoom: true }).catch(() => {})
+                  }
+                }
+              } else if (!this.inCall && latest.inRoom) {
+                // Se o amigo está na sala e eu ainda estou no chat:
+                // Se for Vitinho, conecta em modo apenas recepção para ver a câmera do Will no chat
+                if (this.myUser === 'Vitinho') {
+                  const isDisconnected = !this.peerConnection || this.peerConnection.signalingState === 'closed'
+                  if (isDisconnected) {
+                    console.log('[WebRTC] Will está na sala e Vitinho no chat: Vitinho conectando para receber câmera...')
+                    this.connectReceiveOnlyCall().catch(() => {})
                   }
                 }
               } else if (!this.peerConnection && this.myUser === 'Vitinho') {
@@ -688,8 +686,10 @@ export class MsnWebRTCService {
     return pc
   }
 
-  private routeRemoteTrack(track: MediaStreamTrack, _streams?: readonly MediaStream[]): void {
+  private routeRemoteTrack(track: MediaStreamTrack, streams?: readonly MediaStream[]): void {
     if (!track || track.readyState === 'ended' || !this.peerConnection) return
+
+    const streamId = streams && streams.length > 0 ? streams[0].id : null
 
     const audioTransceivers = this.peerConnection
       .getTransceivers()
@@ -699,13 +699,14 @@ export class MsnWebRTCService {
       .filter((t) => t.receiver.track?.kind === 'video')
 
     if (track.kind === 'audio') {
-      // Transceiver 0 de áudio é SEMPRE o microfone do amigo
-      const isVoice = audioTransceivers.length > 0 && audioTransceivers[0].receiver.track?.id === track.id
-      // Transceiver 1 de áudio (se houver) é o áudio da tela compartilhada se a tela estiver ativa
-      const isScreenAudio =
-        Boolean(this.remoteStreamIds.screenStreamId) &&
-        audioTransceivers.length > 1 &&
-        (audioTransceivers[1].receiver.track?.id === track.id || !isVoice)
+      let isScreenAudio = false
+      if (this.remoteStreamIds.screenStreamId) {
+        if (streamId && streamId === this.remoteStreamIds.screenStreamId) {
+          isScreenAudio = true
+        } else if (audioTransceivers.length > 1 && audioTransceivers[1].receiver.track?.id === track.id) {
+          isScreenAudio = true
+        }
+      }
 
       if (isScreenAudio) {
         if (!this.remoteScreenStream) {
@@ -715,20 +716,21 @@ export class MsnWebRTCService {
           this.remoteScreenStream.addTrack(track)
         }
       } else {
-        // Voz do amigo: NUNCA substitui se já tiver esse track tocando
+        // Voz do amigo: Trilha primária do microfone
         if (!this.remoteVoiceStream || !this.remoteVoiceStream.getAudioTracks().some((t) => t.id === track.id)) {
           this.remoteVoiceStream = new MediaStream([track])
           this.setupRemoteVoiceAnalyser(this.remoteVoiceStream)
         }
       }
     } else if (track.kind === 'video') {
-      // Transceiver 0 de vídeo é SEMPRE a câmera do amigo
-      const isCam = videoTransceivers.length > 0 && videoTransceivers[0].receiver.track?.id === track.id
-      // Transceiver 1 de vídeo (se houver) é a tela compartilhada, SOMENTE se estiver ativa
-      const isScreenVideo =
-        Boolean(this.remoteStreamIds.screenStreamId) &&
-        videoTransceivers.length > 1 &&
-        (videoTransceivers[1].receiver.track?.id === track.id || !isCam)
+      let isScreenVideo = false
+      if (this.remoteStreamIds.screenStreamId) {
+        if (streamId && streamId === this.remoteStreamIds.screenStreamId) {
+          isScreenVideo = true
+        } else if (videoTransceivers.length > 1 && videoTransceivers[1].receiver.track?.id === track.id) {
+          isScreenVideo = true
+        }
+      }
 
       if (isScreenVideo) {
         if (!this.remoteScreenStream) {
@@ -742,24 +744,10 @@ export class MsnWebRTCService {
           this.remoteScreenStream.addTrack(track)
         }
       } else {
-        // Câmera do amigo: NUNCA substitui se já tiver esse track ativo
+        // Câmera do amigo
         if (!this.remoteCamStream || !this.remoteCamStream.getVideoTracks().some((t) => t.id === track.id)) {
           this.remoteCamStream = new MediaStream([track])
         }
-      }
-    }
-
-    track.onmute = () => {
-      if (
-        this.remoteScreenStream &&
-        this.remoteScreenStream.getVideoTracks().some((t) => t.id === track.id)
-      ) {
-        this.remoteScreenStream.removeTrack(track)
-        if (this.remoteScreenStream.getVideoTracks().length === 0) {
-          this.remoteScreenStream = null
-        }
-        this.emitStreamsUpdated()
-        this.emitCallState()
       }
     }
 
@@ -816,7 +804,7 @@ export class MsnWebRTCService {
     if (!this.peerConnection) return
     for (const receiver of this.peerConnection.getReceivers()) {
       const track = receiver.track
-      if (track && track.readyState === 'live' && !track.muted) {
+      if (track && track.readyState === 'live') {
         this.routeRemoteTrack(track)
       }
     }
@@ -840,6 +828,45 @@ export class MsnWebRTCService {
       isMediaCall: false,
       streamIds: this.getLocalStreamIds()
     })
+  }
+
+  public async connectReceiveOnlyCall(): Promise<void> {
+    const pc = this.ensurePeerConnection()
+    if (!this.dataChannel || this.dataChannel.readyState === 'closed') {
+      const dc = pc.createDataChannel('msn-p2p-data', { ordered: true })
+      this.setupDataChannel(dc)
+    }
+
+    const transceivers = pc.getTransceivers()
+    const videoTransceiver = transceivers.find((t) => t.receiver.track?.kind === 'video')
+    if (!videoTransceiver) {
+      pc.addTransceiver('video', { direction: 'recvonly' })
+    }
+    const audioTransceiver = transceivers.find((t) => t.receiver.track?.kind === 'audio')
+    if (!audioTransceiver) {
+      pc.addTransceiver('audio', { direction: 'recvonly' })
+    }
+
+    if (this.myUser === 'Vitinho') {
+      this.makingOffer = true
+      try {
+        const offer = await pc.createOffer({
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: true
+        })
+        if (pc.signalingState === 'closed') return
+        await this.setLocalDescriptionSafe(pc, offer)
+        this.broadcastStreamMeta()
+        await this.sendSignal('sdp-offer', {
+          sdp: pc.localDescription,
+          isMediaCall: true,
+          inRoom: this.inCall,
+          streamIds: this.getLocalStreamIds()
+        })
+      } finally {
+        this.makingOffer = false
+      }
+    }
   }
 
   // ==========================================================================
@@ -1275,14 +1302,20 @@ export class MsnWebRTCService {
       camStreamId: null,
       screenStreamId: null
     }
-    this.resetPeerConnection()
-    this.trackPresenceState()
+    // 1. Notifica o amigo via DataChannel e Realtime antes de fechar a conexão
     this.sendDataChannelPacket({
       type: 'room-state',
       sender: this.myUser,
       inRoom: false
     })
     this.sendSignal('hangup', { inRoom: false }).catch(() => {})
+
+    // 2. Limpa e reinicia o PeerConnection
+    this.resetPeerConnection()
+    this.trackPresenceState()
+    if (this.myUser === 'Vitinho') {
+      this.connectDataChannelOnly().catch(() => {})
+    }
     this.emitStreamsUpdated()
     this.emitCallState()
   }
@@ -1346,8 +1379,16 @@ export class MsnWebRTCService {
       if (isWindow) {
         const parts = sourceId.split(':')
         if (parts.length > 1) {
-          const parsed = parseInt(parts[1], 10)
-          if (!isNaN(parsed) && parsed > 0) windowHwnd = parsed
+          const raw = parts[1].trim()
+          let parsed = 0
+          if (raw.startsWith('0x') || raw.startsWith('0X')) {
+            parsed = parseInt(raw, 16)
+          } else {
+            parsed = parseInt(raw, 10)
+          }
+          if (!isNaN(parsed) && parsed !== 0) {
+            windowHwnd = parsed >>> 0
+          }
         }
       }
 
@@ -1865,9 +1906,11 @@ export class MsnWebRTCService {
       if (!this.remoteStreamIds.screenStreamId && this.remoteScreenStream) {
         this.remoteScreenStream.getTracks().forEach((t) => t.stop())
         this.remoteScreenStream = null
-        this.emitStreamsUpdated()
-        this.emitCallState()
+      } else if (this.remoteStreamIds.screenStreamId) {
+        this.syncRemoteStreamsFromReceivers()
       }
+      this.emitStreamsUpdated()
+      this.emitCallState()
     }
 
     if (type === 'screen-share-state') {
@@ -1878,11 +1921,12 @@ export class MsnWebRTCService {
           this.remoteScreenStream = null
         }
         this.remoteStreamIds.screenStreamId = null
-        this.emitStreamsUpdated()
-        this.emitCallState()
       } else {
         this.remoteStreamIds.screenStreamId = (data.screenStreamId as string) || null
+        this.syncRemoteStreamsFromReceivers()
       }
+      this.emitStreamsUpdated()
+      this.emitCallState()
       return
     }
 
@@ -1892,8 +1936,18 @@ export class MsnWebRTCService {
     }
 
     if (type === 'room-sync-request') {
-      if (this.inCall && this.myUser === 'Vitinho') {
-        this.startCall(Boolean(this.localCamStream)).catch(() => {})
+      if (this.myUser === 'Vitinho') {
+        if (this.inCall) {
+          if (this.peerConnection && this.peerConnection.signalingState === 'stable') {
+            this.renegotiatePeerConnection().catch(() => {})
+          } else {
+            this.rebuildCall().catch(() => {})
+          }
+        } else {
+          // Vitinho está no chat, mas Will entrou na sala:
+          // Conecta em modo de recepção para exibir a webcam de Will no avatar do chat!
+          this.connectReceiveOnlyCall().catch(() => {})
+        }
       }
       return
     }
@@ -1902,7 +1956,9 @@ export class MsnWebRTCService {
       const sdp = data.sdp as RTCSessionDescriptionInit
       const isMediaCall = Boolean(data.isMediaCall) || type === 'renegotiate-offer'
 
-      if (isMediaCall && data.inRoom === undefined) {
+      if (typeof data.inRoom === 'boolean') {
+        this.friendInRoom = data.inRoom
+      } else if (isMediaCall) {
         this.friendInRoom = true
       }
 
@@ -1927,6 +1983,13 @@ export class MsnWebRTCService {
 
       if (this.inCall) {
         await this.ensureTransceiversSendRecv(pc)
+      } else {
+        // Chat mode: apenas recebe vídeo/áudio do amigo, não envia nada
+        for (const tr of pc.getTransceivers()) {
+          if (tr.direction === 'sendrecv' || tr.direction === 'sendonly') {
+            tr.direction = 'recvonly'
+          }
+        }
       }
 
       const answer = await pc.createAnswer()
@@ -1945,6 +2008,9 @@ export class MsnWebRTCService {
 
     if (type === 'sdp-answer') {
       const sdp = data.sdp as RTCSessionDescriptionInit
+      if (typeof data.inRoom === 'boolean') {
+        this.friendInRoom = data.inRoom
+      }
       if (
         this.peerConnection &&
         (this.peerConnection.signalingState === 'have-local-offer' ||
@@ -1998,26 +2064,21 @@ export class MsnWebRTCService {
 
     if (type === 'hangup') {
       console.log('[WebRTC] Sinal de hangup recebido do amigo.')
-      if (this.inCall && this.friendJoinedThisCall) {
-        this.friendJoinedThisCall = false
-        this.handleCallDead('O amigo encerrou a ligação ou saiu da sala.')
-      } else {
-        this.friendInRoom = false
-        this.remoteVoiceStream = null
-        this.remoteCamStream = null
-        this.remoteScreenStream = null
-        this.remoteStreamIds = {
-          micStreamId: null,
-          camStreamId: null,
-          screenStreamId: null
-        }
-        // Bug 14: NÃO destrói o PeerConnection/DataChannel se não estávamos na chamada
-        if (this.myUser === 'Vitinho' && (!this.dataChannel || this.dataChannel.readyState !== 'open')) {
-          this.connectDataChannelOnly().catch(() => {})
-        }
-        this.emitStreamsUpdated()
-        this.emitCallState()
+      this.friendInRoom = false
+      this.friendJoinedThisCall = false
+      this.remoteVoiceStream = null
+      this.remoteCamStream = null
+      this.remoteScreenStream = null
+      this.remoteStreamIds = {
+        micStreamId: null,
+        camStreamId: null,
+        screenStreamId: null
       }
+      if (this.myUser === 'Vitinho' && (!this.dataChannel || this.dataChannel.readyState !== 'open')) {
+        this.connectDataChannelOnly().catch(() => {})
+      }
+      this.emitStreamsUpdated()
+      this.emitCallState()
       return
     }
   }
@@ -2349,9 +2410,9 @@ export class MsnWebRTCService {
         }
       }
 
-      // S4: Volume natural com ganho 1.0 (não distorce nem estoura filmes/músicas)
+      // S4: Make-up gain compensatório de 1.35x com limitador contra atenuação pós-mixer do Windows
       const boostGain = ctx.createGain()
-      boostGain.gain.value = 1.0
+      boostGain.gain.value = 1.35
 
       // Limitador transparente de estúdio contra picos (-3dB threshold, ratio 4)
       const compressor = ctx.createDynamicsCompressor()
@@ -2674,16 +2735,6 @@ export class MsnWebRTCService {
         this.callbacks.onNudgeReceived(packet.sender)
         break
 
-      case 'laser-pointer':
-        this.callbacks.onLaserPointer?.({
-          id: `${Date.now()}-${Math.random()}`,
-          x: packet.x,
-          y: packet.y,
-          sender: packet.sender,
-          createdAt: Date.now()
-        })
-        break
-
       case 'soundboard-wink':
         this.callbacks.onSoundboardWink(packet.sender, packet.winkId, packet.label)
         break
@@ -2761,25 +2812,16 @@ export class MsnWebRTCService {
         break
 
       case 'room-state':
-        const previousFriendInRoom = this.friendInRoom
         this.friendInRoom = packet.inRoom
         if (packet.inRoom) {
           this.friendJoinedThisCall = true
         } else {
+          this.friendJoinedThisCall = false
           this.remoteVoiceStream = null
           this.remoteCamStream = null
           this.remoteScreenStream = null
           this.emitStreamsUpdated()
-          // Bug 1: SÓ encerra chamada se o amigo estava na sala durante esta chamada e agora saiu!
-          // Se o usuário entrou sozinho e o amigo estava no chat (inRoom: false), NÃO derruba!
-          if (this.inCall && (previousFriendInRoom || this.friendJoinedThisCall)) {
-            console.log(
-              '[WebRTC] Amigo que estava na sala saiu via room-state. Encerrando chamada local...'
-            )
-            this.friendJoinedThisCall = false
-            this.handleCallDead('O amigo saiu da sala.')
-            return
-          }
+          console.log('[WebRTC] Amigo saiu da sala via room-state.')
         }
         this.emitCallState()
         break
@@ -2977,15 +3019,6 @@ export class MsnWebRTCService {
       type: 'nudge',
       sender: this.myUser,
       timestamp: new Date().toISOString()
-    })
-  }
-
-  public sendLaserPointer(x: number, y: number): void {
-    this.sendDataChannelPacket({
-      type: 'laser-pointer',
-      sender: this.myUser,
-      x,
-      y
     })
   }
 

@@ -135,7 +135,7 @@ namespace VitinhoWillLoopback
             uint targetPid = 0;
             int loopbackMode = 1; // 1 = EXCLUDE_TARGET_PROCESS_TREE (padrão), 0 = INCLUDE_TARGET_PROCESS_TREE
             uint parentPid = 0;
-            long hwndVal = 0;
+            ulong ulongHwnd = 0;
 
             // Parser flexível de argumentos CLI
             for (int i = 0; i < args.Length; i++)
@@ -151,7 +151,22 @@ namespace VitinhoWillLoopback
                 }
                 else if (arg == "--hwnd" && i + 1 < args.Length)
                 {
-                    long.TryParse(args[++i], out hwndVal);
+                    string hStr = args[++i];
+                    if (hStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                    {
+                        ulong.TryParse(hStr.Substring(2), System.Globalization.NumberStyles.HexNumber, null, out ulongHwnd);
+                    }
+                    else
+                    {
+                        if (!ulong.TryParse(hStr, out ulongHwnd))
+                        {
+                            long signedVal;
+                            if (long.TryParse(hStr, out signedVal))
+                            {
+                                ulongHwnd = unchecked((ulong)signedVal);
+                            }
+                        }
+                    }
                 }
                 else if (arg == "--parent-pid" && i + 1 < args.Length)
                 {
@@ -172,10 +187,10 @@ namespace VitinhoWillLoopback
             }
 
             // Se recebeu HWND de uma janela alvo, resolve o PID correspondente
-            if (hwndVal != 0)
+            if (ulongHwnd != 0)
             {
                 uint winPid = 0;
-                GetWindowThreadProcessId(new IntPtr(hwndVal), out winPid);
+                GetWindowThreadProcessId(new IntPtr(unchecked((long)ulongHwnd)), out winPid);
                 if (winPid != 0)
                 {
                     targetPid = winPid;

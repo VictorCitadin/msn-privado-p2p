@@ -674,12 +674,11 @@ function setupSystemTray(): void {
     {
       label: 'Sair Completamente',
       click: () => {
-        isQuitting = true
         if (rankerWindow && !rankerWindow.isDestroyed()) {
-          rankerWindow.close()
+          rankerWindow.destroy()
         }
         if (djPlayerWindow && !djPlayerWindow.isDestroyed()) {
-          djPlayerWindow.close()
+          djPlayerWindow.destroy()
         }
         app.quit()
       }

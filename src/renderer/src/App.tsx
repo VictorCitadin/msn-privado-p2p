@@ -30,8 +30,7 @@ import {
   PresenceStatus,
   ChatMessageItem,
   DjTrackItem,
-  DjSyncState,
-  LaserPointerPoint
+  DjSyncState
 } from './services/webrtc'
 import {
   soundManager,
@@ -385,7 +384,7 @@ const MainMsnMessengerWindow: React.FC = () => {
 
     // O <audio id="remote-voice"> reproduz diretamente a voz do amigo com estabilidade absoluta e latência zero
     if (remoteVoiceAudioRef.current) {
-      remoteVoiceAudioRef.current.muted = false
+      remoteVoiceAudioRef.current.muted = !inCall
       remoteVoiceAudioRef.current.volume = 1.0
       if (remoteVoiceAudioRef.current.srcObject !== st.remoteVoice) {
         remoteVoiceAudioRef.current.srcObject = st.remoteVoice
@@ -468,7 +467,7 @@ const MainMsnMessengerWindow: React.FC = () => {
         }
       }
     }
-  }, [isWindowVisible, isScreenSharing, remoteScreenSharing, djState.isPlaying, screenMovieVolume])
+  }, [isWindowVisible, inCall, isScreenSharing, remoteScreenSharing, djState.isPlaying, screenMovieVolume])
 
   const bindLocalCamRef = useCallback(
     (el: HTMLVideoElement | null) => {
@@ -1641,7 +1640,10 @@ const MainMsnMessengerWindow: React.FC = () => {
                 autoPlay
                 playsInline
                 muted
-                className="w-full h-full object-contain bg-black"
+                style={{ display: isScreenSharing || remoteScreenSharing ? 'block' : 'none' }}
+                className={`w-full h-full object-contain bg-black ${
+                  isScreenSharing || remoteScreenSharing ? '' : 'hidden opacity-0 pointer-events-none'
+                }`}
               />
 
               {/* Câmera 1 no Canto Superior (Arrastável / Draggable): Minha Câmera Full Widescreen (sem corte quadrado) */}
@@ -2281,7 +2283,7 @@ const MainMsnMessengerWindow: React.FC = () => {
                       }
                     }}
                     className={`msn-avatar-frame p-1.5 rounded-2xl relative overflow-hidden transition-all ${
-                      friendInRoom && hasRemoteCam
+                      hasRemoteCam
                         ? 'w-48 aspect-video cursor-pointer ring-2 ring-[#52b700]'
                         : 'w-36 h-36'
                     }`}
@@ -2291,7 +2293,7 @@ const MainMsnMessengerWindow: React.FC = () => {
                         : friendUser
                     }
                   >
-                    {friendInRoom && hasRemoteCam ? (
+                    {hasRemoteCam ? (
                       <video
                         ref={bindRemoteCamRef}
                         autoPlay
