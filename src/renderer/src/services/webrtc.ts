@@ -517,8 +517,10 @@ export class MsnWebRTCService {
 
   private computeIsFriendOnline(): boolean {
     const now = Date.now()
-    const p2pActive = now - this.lastFriendP2PHeartbeat < 10000
-    const signalActive = now - this.lastFriendSignalReceived < 25000
+    const p2pActive =
+      this.lastFriendP2PHeartbeat > 0 && now - this.lastFriendP2PHeartbeat < 10000
+    const signalActive =
+      this.lastFriendSignalReceived > 0 && now - this.lastFriendSignalReceived < 25000
     const presenceActive =
       this.friendPresenceReceivedAt > 0 && now - this.friendPresenceReceivedAt < 25000
 
@@ -1152,9 +1154,6 @@ export class MsnWebRTCService {
     this.iceRestartAttempts = 0
     this.fullReconnectAttempts = 0
     this.friendJoinedThisCall = false
-    this.lastFriendP2PHeartbeat = Date.now()
-    this.lastFriendRealtimeHeartbeat = Date.now()
-    this.lastFriendSignalReceived = Date.now()
     this.lastAudioBytesStallCount = 0
     this.lastAudioBytesReceived = 0
     this.p2pHeartbeatSeq = 0
