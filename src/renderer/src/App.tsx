@@ -119,6 +119,10 @@ async function compressImageForChat(dataUrl: string): Promise<string> {
   return result
 }
 
+const CALL_CONTROLS_HIDE_DELAY_MS = 5000
+const CORNER_CAM_MIN_WIDTH = 140
+const CORNER_CAM_DEFAULT_WIDTH = 224
+
 const nowTimeLabel = (): string =>
   new Date().toLocaleTimeString('pt-BR', {
     hour: '2-digit',
@@ -216,9 +220,10 @@ const MainMsnMessengerWindow: React.FC = () => {
   const [friendVoiceVolume, setFriendVoiceVolume] = useState<number>(100)
   const [screenMovieVolume, setScreenMovieVolume] = useState<number>(85)
 
-  // Auto-Hide UI (3s) no Modo Cinema
-  const [cinemaControlsVisible, setCinemaControlsVisible] = useState<boolean>(true)
+  // Auto-Hide (5s) dos controles na Sala (ligação e Modo Cinema)
+  const [callControlsVisible, setCallControlsVisible] = useState<boolean>(true)
   const autoHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const callControlsHoveredRef = useRef<boolean>(false)
 
   // Posições Arrastáveis (Draggable) das 2 Câmeras nos Cantos Superiores no Modo Cinema (Tela 4)
   const [myCornerCamPos, setMyCornerCamPos] = useState<{ x: number; y: number }>({
@@ -233,6 +238,18 @@ const MainMsnMessengerWindow: React.FC = () => {
     target: 'my' | 'friend'
     offsetX: number
     offsetY: number
+    width: number
+  } | null>(null)
+
+  // Tamanho (largura em px, proporção 16:9) das 2 câmeras de canto no Modo Cinema
+  const [myCornerCamWidth, setMyCornerCamWidth] = useState<number>(CORNER_CAM_DEFAULT_WIDTH)
+  const [friendCornerCamWidth, setFriendCornerCamWidth] = useState<number>(CORNER_CAM_DEFAULT_WIDTH)
+  const resizingCamRef = useRef<{
+    target: 'my' | 'friend'
+    startX: number
+    startY: number
+    startWidth: number
+    pos: { x: number; y: number }
   } | null>(null)
 
   // DJ Bot WMP (Tela 5)
@@ -1108,18 +1125,58 @@ const MainMsnMessengerWindow: React.FC = () => {
     })
   }
 
-  // Auto-Hide UI após 3 segundos sem mexer o mouse no Modo Cinema (Tela 4)
-  const handleCinemaMouseMove = (): void => {
-    setCinemaControlsVisible(true)
+  // Auto-Hide dos controles da Sala (ligação e compartilhamento de tela) após 5s sem mexer o mouse
+  const isRoomViewVisible = inCall && roomViewActive
+  const scheduleCallControlsHide = useCallback((): void => {
     if (autoHideTimerRef.current) clearTimeout(autoHideTimerRef.current)
     autoHideTimerRef.current = setTimeout(() => {
-      setCinemaControlsVisible(false)
-    }, 3000)
+      // Não esconde enquanto o mouse está sobre a barra ou arrastando/redimensionando uma câmera
+      if (callControlsHoveredRef.current || draggingCamRef.current || resizingCamRef.current) {
+        scheduleCallControlsHide()
+        return
+      }
+      setCallControlsVisible(false)
+    }, CALL_CONTROLS_HIDE_DELAY_MS)
+  }, [])
 
-    if (draggingCamRef.current) {
-      // atualizado no listener global
+  const showCallControls = useCallback((): void => {
+    setCallControlsVisible(true)
+    scheduleCallControlsHide()
+  }, [scheduleCallControlsHide])
+
+  useEffect(() => {
+    // Ao trocar de tela a barra é desmontada sem disparar mouseleave
+    callControlsHoveredRef.current = false
+    if (!isRoomViewVisible) {
+      if (autoHideTimerRef.current) clearTimeout(autoHideTimerRef.current)
+      setCallControlsVisible(true)
+      return
+    }
+    // Ao entrar na sala a barra aparece e some sozinha se o mouse ficar parado
+    showCallControls()
+    window.addEventListener('mousemove', showCallControls)
+    window.addEventListener('mousedown', showCallControls)
+    window.addEventListener('keydown', showCallControls)
+    return () => {
+      window.removeEventListener('mousemove', showCallControls)
+      window.removeEventListener('mousedown', showCallControls)
+      window.removeEventListener('keydown', showCallControls)
+      if (autoHideTimerRef.current) clearTimeout(autoHideTimerRef.current)
+    }
+  }, [isRoomViewVisible, isScreenSharing, remoteScreenSharing, showCallControls])
+
+  const callControlsHoverProps = {
+    onMouseEnter: (): void => {
+      callControlsHoveredRef.current = true
+    },
+    onMouseLeave: (): void => {
+      callControlsHoveredRef.current = false
     }
   }
+
+  const callControlsFadeClass = callControlsVisible
+    ? 'opacity-100 pointer-events-auto'
+    : 'opacity-0 pointer-events-none'
 
   // Arrastar Câmeras nos Cantos na Tela 4
   const startDraggingCornerCam = (
@@ -1131,16 +1188,62 @@ const MainMsnMessengerWindow: React.FC = () => {
     draggingCamRef.current = {
       target,
       offsetX: e.clientX - currentPos.x,
-      offsetY: e.clientY - currentPos.y
+      offsetY: e.clientY - currentPos.y,
+      width: target === 'my' ? myCornerCamWidth : friendCornerCamWidth
     }
+  }
+
+  // Redimensionar Câmeras nos Cantos na Tela 4 (alça no canto inferior direito)
+  const startResizingCornerCam = (
+    target: 'my' | 'friend',
+    e: React.MouseEvent<HTMLDivElement>
+  ): void => {
+    e.stopPropagation()
+    e.preventDefault()
+    resizingCamRef.current = {
+      target,
+      startX: e.clientX,
+      startY: e.clientY,
+      startWidth: target === 'my' ? myCornerCamWidth : friendCornerCamWidth,
+      pos: target === 'my' ? myCornerCamPos : friendCornerCamPos
+    }
+  }
+
+  const clampCornerCamWidth = (width: number, pos: { x: number; y: number }): number => {
+    const maxByWidth = window.innerWidth - pos.x - 8
+    const maxByHeight = ((window.innerHeight - pos.y - 8) * 16) / 9
+    const max = Math.max(CORNER_CAM_MIN_WIDTH, Math.min(maxByWidth, maxByHeight))
+    return Math.round(Math.max(CORNER_CAM_MIN_WIDTH, Math.min(max, width)))
+  }
+
+  // Rodinha do mouse sobre a câmera também aumenta/diminui
+  const handleCornerCamWheel = (target: 'my' | 'friend', e: React.WheelEvent<HTMLDivElement>): void => {
+    const pos = target === 'my' ? myCornerCamPos : friendCornerCamPos
+    const setWidth = target === 'my' ? setMyCornerCamWidth : setFriendCornerCamWidth
+    const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1
+    setWidth((prev) => clampCornerCamWidth(prev * factor, pos))
   }
 
   useEffect(() => {
     const onMouseMove = (e: MouseEvent): void => {
-      if (!draggingCamRef.current) return
-      const nextX = Math.max(8, Math.min(window.innerWidth - 160, e.clientX - draggingCamRef.current.offsetX))
-      const nextY = Math.max(8, Math.min(window.innerHeight - 160, e.clientY - draggingCamRef.current.offsetY))
-      if (draggingCamRef.current.target === 'my') {
+      const resizing = resizingCamRef.current
+      if (resizing) {
+        const dx = e.clientX - resizing.startX
+        const dy = ((e.clientY - resizing.startY) * 16) / 9
+        const nextWidth = clampCornerCamWidth(resizing.startWidth + Math.max(dx, dy), resizing.pos)
+        if (resizing.target === 'my') {
+          setMyCornerCamWidth(nextWidth)
+        } else {
+          setFriendCornerCamWidth(nextWidth)
+        }
+        return
+      }
+      const dragging = draggingCamRef.current
+      if (!dragging) return
+      const height = (dragging.width * 9) / 16
+      const nextX = Math.max(8, Math.min(window.innerWidth - dragging.width - 8, e.clientX - dragging.offsetX))
+      const nextY = Math.max(8, Math.min(window.innerHeight - height - 8, e.clientY - dragging.offsetY))
+      if (dragging.target === 'my') {
         setMyCornerCamPos({ x: nextX, y: nextY })
       } else {
         setFriendCornerCamPos({ x: nextX, y: nextY })
@@ -1148,6 +1251,7 @@ const MainMsnMessengerWindow: React.FC = () => {
     }
     const onMouseUp = (): void => {
       draggingCamRef.current = null
+      resizingCamRef.current = null
     }
     window.addEventListener('mousemove', onMouseMove)
     window.addEventListener('mouseup', onMouseUp)
@@ -1737,10 +1841,7 @@ const MainMsnMessengerWindow: React.FC = () => {
           {/* TELA 4: LIGAÇÃO DE VÍDEO + COMPARTILHAMENTO DE TELA (MODO CINEMA) */}
           {/* ================================================================ */}
           {isCinemaScreenMode ? (
-            <div
-              onMouseMove={handleCinemaMouseMove}
-              className="relative w-full h-full bg-black overflow-hidden select-none cursor-default"
-            >
+            <div className="relative w-full h-full bg-black overflow-hidden select-none cursor-default">
               {/* Alerta de Saúde da Conexão / Reconexão Automática P2P */}
               {(callHealth === 'degraded' || callHealth === 'recovering') && (
                 <div className="absolute top-4 left-4 z-40 px-3 py-1.5 rounded-xl bg-amber-500/95 text-slate-950 text-xs font-bold flex items-center gap-2 shadow-2xl animate-pulse">
@@ -1769,10 +1870,11 @@ const MainMsnMessengerWindow: React.FC = () => {
               {/* Câmera 1 no Canto Superior (Arrastável / Draggable): Minha Câmera Full Widescreen (sem corte quadrado) */}
               <div
                 onMouseDown={(e) => startDraggingCornerCam('my', e)}
+                onWheel={(e) => handleCornerCamWheel('my', e)}
                 onClick={(e) => e.stopPropagation()}
-                style={{ left: myCornerCamPos.x, top: myCornerCamPos.y }}
-                className="absolute z-20 w-56 aspect-video rounded-xl overflow-hidden border-2 border-[#4facfe] bg-black shadow-2xl cursor-move"
-                title="Arraste para mover sua câmera para qualquer canto"
+                style={{ left: myCornerCamPos.x, top: myCornerCamPos.y, width: myCornerCamWidth }}
+                className="group absolute z-20 aspect-video rounded-xl overflow-hidden border-2 border-[#4facfe] bg-black shadow-2xl cursor-move"
+                title="Arraste para mover • Puxe o canto ou use a rodinha do mouse para redimensionar"
               >
                 <video
                   ref={bindLocalCamRef}
@@ -1784,15 +1886,27 @@ const MainMsnMessengerWindow: React.FC = () => {
                 <span className="absolute bottom-1.5 left-2 px-1.5 py-0.5 rounded bg-black/70 text-white text-[10px] font-bold">
                   {loggedInUser} (Você)
                 </span>
+                {/* Alça de redimensionar (arraste o canto) — a rodinha do mouse também aumenta/diminui */}
+                <div
+                  onMouseDown={(e) => startResizingCornerCam('my', e)}
+                  onClick={(e) => e.stopPropagation()}
+                  className="absolute bottom-0 right-0 w-5 h-5 cursor-nwse-resize opacity-0 group-hover:opacity-100 transition-opacity"
+                  title="Arraste para aumentar ou diminuir"
+                >
+                  <svg viewBox="0 0 20 20" className="w-full h-full text-white/90 drop-shadow">
+                    <path d="M18 8 L8 18 M18 13 L13 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                  </svg>
+                </div>
               </div>
 
               {/* Câmera 2 no Canto Superior (Arrastável / Draggable): Câmera do Amigo Full Widescreen (sem corte quadrado) */}
               <div
                 onMouseDown={(e) => startDraggingCornerCam('friend', e)}
+                onWheel={(e) => handleCornerCamWheel('friend', e)}
                 onClick={(e) => e.stopPropagation()}
-                style={{ left: friendCornerCamPos.x, top: friendCornerCamPos.y }}
-                className="absolute z-20 w-56 aspect-video rounded-xl overflow-hidden border-2 border-[#52b700] bg-black shadow-2xl cursor-move"
-                title={`Arraste para mover a câmera de ${friendUser}`}
+                style={{ left: friendCornerCamPos.x, top: friendCornerCamPos.y, width: friendCornerCamWidth }}
+                className="group absolute z-20 aspect-video rounded-xl overflow-hidden border-2 border-[#52b700] bg-black shadow-2xl cursor-move"
+                title={`Arraste para mover a câmera de ${friendUser} • Puxe o canto ou use a rodinha para redimensionar`}
               >
                 <video
                   ref={bindRemoteCamRef}
@@ -1804,16 +1918,24 @@ const MainMsnMessengerWindow: React.FC = () => {
                 <span className="absolute bottom-1.5 left-2 px-1.5 py-0.5 rounded bg-black/70 text-white text-[10px] font-bold">
                   {friendUser}
                 </span>
+                {/* Alça de redimensionar (arraste o canto) — a rodinha do mouse também aumenta/diminui */}
+                <div
+                  onMouseDown={(e) => startResizingCornerCam('friend', e)}
+                  onClick={(e) => e.stopPropagation()}
+                  className="absolute bottom-0 right-0 w-5 h-5 cursor-nwse-resize opacity-0 group-hover:opacity-100 transition-opacity"
+                  title="Arraste para aumentar ou diminuir"
+                >
+                  <svg viewBox="0 0 20 20" className="w-full h-full text-white/90 drop-shadow">
+                    <path d="M18 8 L8 18 M18 13 L13 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                  </svg>
+                </div>
               </div>
 
               {/* Botão Rápido de Tela Cheia no Canto Superior Direito (Modo Cinema) */}
               <div
+                {...callControlsHoverProps}
                 onClick={(e) => e.stopPropagation()}
-                className={`absolute top-4 right-4 z-30 transition-opacity duration-300 ${
-                  cinemaControlsVisible
-                    ? 'opacity-100 pointer-events-auto'
-                    : 'opacity-0 pointer-events-none'
-                }`}
+                className={`absolute top-4 right-4 z-30 transition-opacity duration-300 ${callControlsFadeClass}`}
               >
                 <button
                   type="button"
@@ -1835,14 +1957,11 @@ const MainMsnMessengerWindow: React.FC = () => {
                 </button>
               </div>
 
-              {/* Barra Flutuante + Mixer de Áudio Independente (Auto-Hide após 3 segundos sem mexer o mouse) */}
+              {/* Barra Flutuante + Mixer de Áudio Independente (Auto-Hide após 5 segundos sem mexer o mouse) */}
               <div
+                {...callControlsHoverProps}
                 onClick={(e) => e.stopPropagation()}
-                className={`absolute bottom-5 left-1/2 -translate-x-1/2 z-30 transition-opacity duration-300 ${
-                  cinemaControlsVisible
-                    ? 'opacity-100 pointer-events-auto'
-                    : 'opacity-0 pointer-events-none'
-                }`}
+                className={`absolute bottom-5 left-1/2 -translate-x-1/2 z-30 transition-opacity duration-300 ${callControlsFadeClass}`}
               >
                 <div className="px-5 py-3 rounded-2xl bg-slate-950/90 backdrop-blur-md border border-slate-700 shadow-2xl flex flex-wrap items-center gap-4 text-white">
                   <button
@@ -2017,8 +2136,11 @@ const MainMsnMessengerWindow: React.FC = () => {
                 </div>
               )}
 
-              {/* Botões Rápidos no Canto Superior Direito (Ver Chat + Tela Cheia) */}
-              <div className="absolute top-4 right-4 z-30 flex items-center gap-2">
+              {/* Botões Rápidos no Canto Superior Direito (Ver Chat + Tela Cheia) — somem após 5s parado */}
+              <div
+                {...callControlsHoverProps}
+                className={`absolute top-4 right-4 z-30 flex items-center gap-2 transition-opacity duration-300 ${callControlsFadeClass}`}
+              >
                 <button
                   type="button"
                   onClick={() => setRoomViewActive(false)}
@@ -2091,8 +2213,11 @@ const MainMsnMessengerWindow: React.FC = () => {
                 </span>
               </div>
 
-              {/* Barra de Controles Flutuante + Mixer de Voz */}
-              <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-30 px-5 py-2.5 rounded-2xl bg-slate-950/90 backdrop-blur-md border border-slate-700 shadow-2xl flex items-center gap-3 text-white">
+              {/* Barra de Controles Flutuante + Mixer de Voz (Auto-Hide após 5 segundos sem mexer o mouse) */}
+              <div
+                {...callControlsHoverProps}
+                className={`absolute bottom-4 left-1/2 -translate-x-1/2 z-30 px-5 py-2.5 rounded-2xl bg-slate-950/90 backdrop-blur-md border border-slate-700 shadow-2xl flex items-center gap-3 text-white transition-opacity duration-300 ${callControlsFadeClass}`}
+              >
                 <button
                   type="button"
                   onClick={() => {
