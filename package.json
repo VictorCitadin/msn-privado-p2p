@@ -1,7 +1,7 @@
 {
   "name": "msn-privado-p2p",
-  "version": "1.0.20",
-  "description": "Vitinho e Will — Messenger Privado P2P + DJ Bot + Album Ranker",
+  "version": "2.0.0",
+  "description": "Vitinho, Will e Nath — Messenger Privado P2P + DJ Bot + Album Ranker",
   "main": "./out/main/index.js",
   "author": "Vitinho & Will",
   "homepage": "https://msn-privado-p2p.vercel.app",
@@ -17,7 +17,11 @@
     "build:loopback": "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /optimize+ /platform:x64 /target:exe /out:resources\\loopback-capture.exe native\\LoopbackCapture.cs",
     "build:win": "npm run build && electron-builder --win --x64",
     "release": "npm run build && electron-builder --win --x64 --publish always",
-    "build:unpack": "npm run build && electron-builder --dir"
+    "build:unpack": "npm run build && electron-builder --dir",
+    "build:mobile": "vite build --config vite.mobile.config.ts",
+    "dev:mobile": "vite --config vite.mobile.config.ts",
+    "android:sync": "npm run build:mobile && cap sync android",
+    "android:apk": "node scripts/build-apk.cjs"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.1",
@@ -29,6 +33,9 @@
     "yt-search": "^2.11.1"
   },
   "devDependencies": {
+    "@capacitor/android": "8.5.3",
+    "@capacitor/cli": "8.5.3",
+    "@capacitor/core": "8.5.3",
     "@electron-toolkit/tsconfig": "^1.0.1",
     "@types/node": "^20.14.8",
     "@types/react": "^18.3.3",

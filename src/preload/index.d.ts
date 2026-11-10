@@ -9,7 +9,7 @@ import type {
 
 export interface MsnBridgeApi {
   getSession: () => Promise<{
-    sessionUser: 'Vitinho' | 'Will' | null
+    sessionUser: 'Vitinho' | 'Will' | 'Nath' | null
     subnick: string
     ecoMode: boolean
     audioDeviceId: string
@@ -17,7 +17,7 @@ export interface MsnBridgeApi {
     chatMessages: StoredChatMessage[]
   }>
   setSession: (payload: {
-    sessionUser?: 'Vitinho' | 'Will' | null
+    sessionUser?: 'Vitinho' | 'Will' | 'Nath' | null
     subnick?: string
     ecoMode?: boolean
     audioDeviceId?: string

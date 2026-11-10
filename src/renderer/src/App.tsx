@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Video,
   VideoOff,
@@ -30,8 +30,12 @@ import {
   PresenceStatus,
   ChatMessageItem,
   DjTrackItem,
-  DjSyncState
+  DjSyncState,
+  RemotePeerStreams,
+  ALL_USERS,
+  sharesChatHistory
 } from './services/webrtc'
+import { USER_AVATARS, USER_COLORS, joinNames } from './services/avatars'
 import {
   soundManager,
   SOUNDBOARD_ITEMS,
@@ -40,47 +44,6 @@ import {
 import { ScreenShareModal } from './components/ScreenShareModal'
 import { DJBotDrawer } from './components/DJBotDrawer'
 import { AlbumRankerWindow } from './components/AlbumRankerWindow'
-
-// Avatares Nostálgicos Frutiger Aero / MSN em SVG Data URI para Vitinho e Will
-const AVATAR_VITINHO =
-  'data:image/svg+xml;utf8,' +
-  encodeURIComponent(`
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
-    <defs>
-      <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0%" stop-color="#0284c7"/>
-        <stop offset="100%" stop-color="#0f172a"/>
-      </linearGradient>
-      <linearGradient id="b1" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#38bdf8"/>
-        <stop offset="100%" stop-color="#0369a1"/>
-      </linearGradient>
-    </defs>
-    <rect width="120" height="120" rx="18" fill="url(#g1)"/>
-    <circle cx="60" cy="44" r="21" fill="url(#b1)" stroke="#e0f2fe" stroke-width="3"/>
-    <path d="M24 102 C24 72, 96 72, 96 102 Z" fill="url(#b1)" stroke="#e0f2fe" stroke-width="3"/>
-    <text x="60" y="114" font-family="Tahoma" font-size="11" font-weight="bold" fill="#7dd3fc" text-anchor="middle">VITINHO</text>
-  </svg>`)
-
-const AVATAR_WILL =
-  'data:image/svg+xml;utf8,' +
-  encodeURIComponent(`
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
-    <defs>
-      <linearGradient id="g2" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0%" stop-color="#15803d"/>
-        <stop offset="100%" stop-color="#052e16"/>
-      </linearGradient>
-      <linearGradient id="b2" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#4ade80"/>
-        <stop offset="100%" stop-color="#15803d"/>
-      </linearGradient>
-    </defs>
-    <rect width="120" height="120" rx="18" fill="url(#g2)"/>
-    <circle cx="60" cy="44" r="21" fill="url(#b2)" stroke="#dcfce7" stroke-width="3"/>
-    <path d="M24 102 C24 72, 96 72, 96 102 Z" fill="url(#b2)" stroke="#dcfce7" stroke-width="3"/>
-    <text x="60" y="114" font-family="Tahoma" font-size="11" font-weight="bold" fill="#86efac" text-anchor="middle">WILL</text>
-  </svg>`)
 
 // Uma mensagem do RTCDataChannel aceita no máximo 256 KB (e o fallback Realtime também tem limite).
 // Prints colados em PNG passam disso facilmente, então são reduzidos/convertidos para JPEG antes do envio.
@@ -117,6 +80,13 @@ async function compressImageForChat(dataUrl: string): Promise<string> {
     }
   }
   return result
+}
+
+type CornerCamKey = 'me' | MsnUser
+interface CornerCamLayout {
+  x: number
+  y: number
+  width: number
 }
 
 const CALL_CONTROLS_HIDE_DELAY_MS = 5000
@@ -168,8 +138,12 @@ const MainMsnMessengerWindow: React.FC = () => {
   const [myStatus, setMyStatus] = useState<PresenceStatus>('online')
   const [customSubnick, setCustomSubnick] = useState<string>('')
   const [musicSubnick, setMusicSubnick] = useState<string | null>(null)
-  const [friendStatus, setFriendStatus] = useState<PresenceStatus>('offline')
-  const [friendSubnick, setFriendSubnick] = useState<string>('')
+  // Presença de cada amigo (Vitinho, Will e — às vezes — a Nath)
+  const [presence, setPresence] = useState<Record<MsnUser, { status: PresenceStatus; subnick: string }>>({
+    Vitinho: { status: 'offline', subnick: '' },
+    Will: { status: 'offline', subnick: '' },
+    Nath: { status: 'offline', subnick: '' }
+  })
 
   const [messages, setMessages] = useState<ChatMessageItem[]>([])
   const messagesLoadedRef = useRef<boolean>(false)
@@ -192,12 +166,13 @@ const MainMsnMessengerWindow: React.FC = () => {
   // Estados de Sala Sempre Existente (Tela 3) e Compartilhamento de Tela Modo Cinema (Tela 4)
   const [inCall, setInCall] = useState<boolean>(false)
   const [callHealth, setCallHealth] = useState<'connecting' | 'healthy' | 'degraded' | 'recovering' | 'dead'>('connecting')
-  const [friendInRoom, setFriendInRoom] = useState<boolean>(false)
+  const [friendsInRoom, setFriendsInRoom] = useState<MsnUser[]>([])
   const [roomViewActive, setRoomViewActive] = useState<boolean>(false)
   const [hasLocalCam, setHasLocalCam] = useState<boolean>(false)
-  const [hasRemoteCam, setHasRemoteCam] = useState<boolean>(false)
+  // Amigos cuja câmera está chegando agora
+  const [remoteCamFriends, setRemoteCamFriends] = useState<MsnUser[]>([])
   const [isScreenSharing, setIsScreenSharing] = useState<boolean>(false)
-  const [remoteScreenSharing, setRemoteScreenSharing] = useState<boolean>(false)
+  const [remoteScreenSharer, setRemoteScreenSharer] = useState<MsnUser | null>(null)
   const [screenModalOpen, setScreenModalOpen] = useState<boolean>(false)
 
   const [isMicMuted, setIsMicMuted] = useState<boolean>(false)
@@ -225,27 +200,22 @@ const MainMsnMessengerWindow: React.FC = () => {
   const autoHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const callControlsHoveredRef = useRef<boolean>(false)
 
-  // Posições Arrastáveis (Draggable) das 2 Câmeras nos Cantos Superiores no Modo Cinema (Tela 4)
-  const [myCornerCamPos, setMyCornerCamPos] = useState<{ x: number; y: number }>({
-    x: 16,
-    y: 16
-  })
-  const [friendCornerCamPos, setFriendCornerCamPos] = useState<{ x: number; y: number }>({
-    x: 252,
-    y: 16
+  // Posição e tamanho (largura em px, proporção 16:9) das câmeras de canto no Modo Cinema (Tela 4).
+  // Chave 'me' = minha câmera; demais chaves = nome do amigo.
+  const [cornerCams, setCornerCams] = useState<Record<CornerCamKey, CornerCamLayout>>({
+    me: { x: 16, y: 16, width: CORNER_CAM_DEFAULT_WIDTH },
+    Vitinho: { x: 252, y: 16, width: CORNER_CAM_DEFAULT_WIDTH },
+    Will: { x: 252, y: 16, width: CORNER_CAM_DEFAULT_WIDTH },
+    Nath: { x: 488, y: 16, width: CORNER_CAM_DEFAULT_WIDTH }
   })
   const draggingCamRef = useRef<{
-    target: 'my' | 'friend'
+    target: CornerCamKey
     offsetX: number
     offsetY: number
     width: number
   } | null>(null)
-
-  // Tamanho (largura em px, proporção 16:9) das 2 câmeras de canto no Modo Cinema
-  const [myCornerCamWidth, setMyCornerCamWidth] = useState<number>(CORNER_CAM_DEFAULT_WIDTH)
-  const [friendCornerCamWidth, setFriendCornerCamWidth] = useState<number>(CORNER_CAM_DEFAULT_WIDTH)
   const resizingCamRef = useRef<{
-    target: 'my' | 'friend'
+    target: CornerCamKey
     startX: number
     startY: number
     startWidth: number
@@ -272,26 +242,38 @@ const MainMsnMessengerWindow: React.FC = () => {
   const streamsRef = useRef<{
     localCam: MediaStream | null
     localScreen: MediaStream | null
-    remoteVoice: MediaStream | null
-    remoteCam: MediaStream | null
-    remoteScreen: MediaStream | null
+    remotes: Partial<Record<MsnUser, RemotePeerStreams>>
   }>({
     localCam: null,
     localScreen: null,
-    remoteVoice: null,
-    remoteCam: null,
-    remoteScreen: null
+    remotes: {}
   })
 
-  const remoteVoiceAudioRef = useRef<HTMLAudioElement | null>(null)
+  // Um <audio> de voz por amigo (a voz de cada um chega por uma conexão P2P própria)
+  const remoteVoiceAudioRefs = useRef<Partial<Record<MsnUser, HTMLAudioElement | null>>>({})
   const remoteScreenAudioRef = useRef<HTMLAudioElement | null>(null)
   const localCamElementsRef = useRef<Set<HTMLVideoElement>>(new Set())
-  const remoteCamElementsRef = useRef<Set<HTMLVideoElement>>(new Set())
+  const remoteCamElementsRef = useRef<Record<MsnUser, Set<HTMLVideoElement>>>({
+    Vitinho: new Set(),
+    Will: new Set(),
+    Nath: new Set()
+  })
   const remoteScreenVideoRef = useRef<HTMLVideoElement | null>(null)
   const chatEndRef = useRef<HTMLDivElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
+  // Amigo "principal" (Vitinho↔Will) e a Nath, que só aparece quando está online
   const friendUser: MsnUser = loggedInUser === 'Vitinho' ? 'Will' : 'Vitinho'
+  const otherUsers: MsnUser[] = ALL_USERS.filter((u) => u !== loggedInUser)
+  const friendStatus = presence[friendUser].status
+  const friendSubnick = presence[friendUser].subnick
+  const nathStatus = presence.Nath.status
+  const isNathVisible =
+    loggedInUser !== 'Nath' && (nathStatus !== 'offline' || friendsInRoom.includes('Nath'))
+  const friendInRoom = friendsInRoom.length > 0
+  const remoteScreenSharing = Boolean(remoteScreenSharer)
+  const onlineFriends = otherUsers.filter((u) => presence[u].status !== 'offline')
+  const friendsInRoomLabel = joinNames(friendsInRoom)
   const effectiveMySubnick = musicSubnick
     ? `🎵 Ouvindo: ${musicSubnick}`
     : customSubnick
@@ -416,16 +398,17 @@ const MainMsnMessengerWindow: React.FC = () => {
 
   // Toca som ao alguém entrar na Sala de ligação e som ao alguém sair da Sala
   const prevInCallRef = useRef<boolean>(false)
-  const prevFriendInRoomRef = useRef<boolean>(false)
+  const prevFriendsInRoomCountRef = useRef<number>(0)
   const droppedByNetworkRef = useRef<boolean>(false)
+  const friendsInRoomCount = friendsInRoom.length
   useEffect(() => {
     const myJoined = !prevInCallRef.current && inCall
     const myLeft = prevInCallRef.current && !inCall
-    const friendJoined = !prevFriendInRoomRef.current && friendInRoom
-    const friendLeft = prevFriendInRoomRef.current && !friendInRoom
+    const friendJoined = friendsInRoomCount > prevFriendsInRoomCountRef.current
+    const friendLeft = friendsInRoomCount < prevFriendsInRoomCountRef.current
 
     prevInCallRef.current = inCall
-    prevFriendInRoomRef.current = friendInRoom
+    prevFriendsInRoomCountRef.current = friendsInRoomCount
 
     if (myJoined || friendJoined) {
       soundManager.play('room-join')
@@ -437,7 +420,7 @@ const MainMsnMessengerWindow: React.FC = () => {
         soundManager.play('room-leave')
       }
     }
-  }, [inCall, friendInRoom])
+  }, [inCall, friendsInRoomCount])
 
   // ==========================================================================
   // 2. CONGELAMENTO DE RENDERIZAÇÃO DE VÍDEO QUANDO MINIMIZADO/OCULTO (0% GPU)
@@ -445,23 +428,28 @@ const MainMsnMessengerWindow: React.FC = () => {
   const syncMediaElementsWithVisibility = useCallback(() => {
     const st = streamsRef.current
 
-    // O <audio id="remote-voice"> reproduz diretamente a voz do amigo de 0% a 100%.
-    // Acima de 100% (boost) a voz sai pelo Web Audio do serviço e o elemento fica mutado.
-    if (remoteVoiceAudioRef.current) {
-      remoteVoiceAudioRef.current.muted =
-        !inCall || MsnWebRTCService.isVoiceBoostVolume(friendVoiceVolume)
-      remoteVoiceAudioRef.current.volume = Math.max(0, Math.min(1, friendVoiceVolume / 100))
-      if (remoteVoiceAudioRef.current.srcObject !== st.remoteVoice) {
-        remoteVoiceAudioRef.current.srcObject = st.remoteVoice
+    // Um <audio> por amigo reproduz a voz dele de 0% a 100%.
+    // Acima de 100% (boost) a voz sai pelo Web Audio do serviço e os elementos ficam mutados.
+    for (const friend of ALL_USERS) {
+      const audioEl = remoteVoiceAudioRefs.current[friend]
+      if (!audioEl) continue
+      const voice = st.remotes[friend]?.voice || null
+      audioEl.muted = !inCall || MsnWebRTCService.isVoiceBoostVolume(friendVoiceVolume)
+      audioEl.volume = Math.max(0, Math.min(1, friendVoiceVolume / 100))
+      if (audioEl.srcObject !== voice) {
+        audioEl.srcObject = voice
       }
-      if (inCall && st.remoteVoice && remoteVoiceAudioRef.current.paused) {
-        remoteVoiceAudioRef.current.play().catch(() => {})
+      if (inCall && voice && audioEl.paused) {
+        audioEl.play().catch(() => {})
       }
     }
 
+    // Tela compartilhada que estou assistindo (de quem estiver compartilhando)
+    const remoteScreen = remoteScreenSharer ? st.remotes[remoteScreenSharer]?.screen || null : null
+
     // O <audio id="remote-screen-audio"> reproduz o som do filme/sistema sem engasgos
     if (remoteScreenAudioRef.current) {
-      const screenAudioStream = st.remoteScreen
+      const screenAudioStream = remoteScreen
       if (
         !isScreenSharing &&
         remoteScreenSharing &&
@@ -491,8 +479,10 @@ const MainMsnMessengerWindow: React.FC = () => {
       for (const el of localCamElementsRef.current) {
         if (el.isConnected) el.srcObject = null
       }
-      for (const el of remoteCamElementsRef.current) {
-        if (el.isConnected) el.srcObject = null
+      for (const set of Object.values(remoteCamElementsRef.current)) {
+        for (const el of set) {
+          if (el.isConnected) el.srcObject = null
+        }
       }
       if (remoteScreenVideoRef.current && remoteScreenVideoRef.current.srcObject !== null) {
         remoteScreenVideoRef.current.srcObject = null
@@ -511,16 +501,19 @@ const MainMsnMessengerWindow: React.FC = () => {
       }
     }
 
-    // Restaura TODOS os vídeos de câmera remota conectados no DOM (avatar, sala 1x1, modo cinema)
-    for (const el of remoteCamElementsRef.current) {
-      if (el.isConnected && el.srcObject !== st.remoteCam) {
-        el.srcObject = st.remoteCam
-        el.play().catch(() => {})
+    // Restaura TODOS os vídeos de câmera remota conectados no DOM (avatar, sala, modo cinema)
+    for (const friend of ALL_USERS) {
+      const cam = st.remotes[friend]?.cam || null
+      for (const el of remoteCamElementsRef.current[friend]) {
+        if (el.isConnected && el.srcObject !== cam) {
+          el.srcObject = cam
+          el.play().catch(() => {})
+        }
       }
     }
 
     // Vídeo da Tela Compartilhada (Modo Cinema): limpa imediatamente ao parar de compartilhar
-    const activeScreenStream = st.remoteScreen || st.localScreen
+    const activeScreenStream = remoteScreen || st.localScreen
     if (remoteScreenVideoRef.current) {
       if (activeScreenStream && (isScreenSharing || remoteScreenSharing)) {
         if (remoteScreenVideoRef.current.srcObject !== activeScreenStream) {
@@ -541,6 +534,7 @@ const MainMsnMessengerWindow: React.FC = () => {
     inCall,
     isScreenSharing,
     remoteScreenSharing,
+    remoteScreenSharer,
     djState.isPlaying,
     screenMovieVolume,
     friendVoiceVolume
@@ -573,37 +567,41 @@ const MainMsnMessengerWindow: React.FC = () => {
     [isWindowVisible]
   )
 
-  const bindRemoteCamRef = useCallback(
-    (el: HTMLVideoElement | null) => {
+  // Um callback de ref por amigo: cada <video> de câmera remota fica ligado à câmera daquele amigo
+  const bindRemoteCamRefs = useMemo(() => {
+    const make = (friend: MsnUser) => (el: HTMLVideoElement | null): void => {
+      const set = remoteCamElementsRef.current[friend]
       if (el) {
-        remoteCamElementsRef.current.add(el)
-        if (isWindowVisible && streamsRef.current.remoteCam) {
-          if (el.srcObject !== streamsRef.current.remoteCam) {
-            el.srcObject = streamsRef.current.remoteCam
-            el.play().catch(() => {})
-          }
+        set.add(el)
+        const cam = streamsRef.current.remotes[friend]?.cam || null
+        if (isWindowVisible && cam && el.srcObject !== cam) {
+          el.srcObject = cam
+          el.play().catch(() => {})
         }
       } else {
-        for (const video of remoteCamElementsRef.current) {
+        for (const video of set) {
           if (!video.isConnected) {
             video.srcObject = null
-            remoteCamElementsRef.current.delete(video)
+            set.delete(video)
           }
         }
       }
-    },
-    [isWindowVisible]
-  )
+    }
+    return { Vitinho: make('Vitinho'), Will: make('Will'), Nath: make('Nath') } as Record<
+      MsnUser,
+      (el: HTMLVideoElement | null) => void
+    >
+  }, [isWindowVisible])
 
   useEffect(() => {
     syncMediaElementsWithVisibility()
   }, [
     isWindowVisible,
     inCall,
-    friendInRoom,
+    friendsInRoomCount,
     roomViewActive,
     hasLocalCam,
-    hasRemoteCam,
+    remoteCamFriends,
     isScreenSharing,
     remoteScreenSharing,
     syncMediaElementsWithVisibility
@@ -668,15 +666,15 @@ const MainMsnMessengerWindow: React.FC = () => {
     if (!loggedInUser) return
 
     const service = new MsnWebRTCService(loggedInUser, {
-      onFriendPresenceChange: (status, subnick, justLoggedIn) => {
-        setFriendStatus(status)
-        setFriendSubnick(subnick)
+      onFriendPresenceChange: (friend, status, subnick, justLoggedIn) => {
+        setPresence((prev) => {
+          const current = prev[friend]
+          if (current.status === status && current.subnick === subnick) return prev
+          return { ...prev, [friend]: { status, subnick } }
+        })
         if (justLoggedIn) {
           soundManager.play('login')
-          window.msnApi.showNativeNotification(
-            'Vitinho e Will',
-            `${loggedInUser === 'Vitinho' ? 'Will' : 'Vitinho'} acabou de entrar!`
-          )
+          window.msnApi.showNativeNotification('Vitinho e Will', `${friend} acabou de entrar!`)
         }
       },
       onChatMessage: (msg) => {
@@ -686,7 +684,9 @@ const MainMsnMessengerWindow: React.FC = () => {
           return [...prev, msg]
         })
       },
-      onChatHistorySync: (remoteMsgs) => {
+      onChatHistorySync: (sender, remoteMsgs) => {
+        // Só Vitinho↔Will compartilham o histórico; a Nath vê apenas o que é dito com ela online
+        if (!sharesChatHistory(loggedInUser, sender)) return
         setMessages((prev) => {
           const existingIds = new Set(prev.map((m) => m.id))
           const missing = remoteMsgs.filter((m) => m?.id && !existingIds.has(m.id))
@@ -694,14 +694,14 @@ const MainMsnMessengerWindow: React.FC = () => {
           return [...prev, ...missing].slice(-300)
         })
       },
-      onDataChannelOpen: () => {
-        if (messagesRef.current.length > 0) {
-          service.sendChatHistorySync(messagesRef.current)
+      onDataChannelOpen: (friend) => {
+        if (messagesRef.current.length > 0 && sharesChatHistory(loggedInUser, friend)) {
+          service.sendChatHistorySync(friend, messagesRef.current)
         }
         // Quem entra depois recebe a fila atual do DJ Bot; antes ele começava com a fila vazia e,
         // ao adicionar uma música, sobrescrevia a playlist inteira do amigo.
         if (djStateRef.current.playlist.length > 0) {
-          service.sendDjSync(djStateRef.current, true)
+          service.sendDjSync(djStateRef.current, true, friend)
         }
       },
       onNudgeReceived: (sender) => {
@@ -769,15 +769,19 @@ const MainMsnMessengerWindow: React.FC = () => {
       onCallStateChange: (state) => {
         setInCall(state.inCall)
         setCallHealth(state.callHealth)
-        setFriendInRoom(state.friendInRoom)
+        setFriendsInRoom((prev) =>
+          prev.length === state.friendsInRoom.length && prev.every((f) => state.friendsInRoom.includes(f))
+            ? prev
+            : state.friendsInRoom
+        )
         setIsScreenSharing(state.isScreenSharing)
-        setRemoteScreenSharing(state.remoteScreenSharing)
+        setRemoteScreenSharer(state.remoteScreenSharer)
         if (!state.inCall) {
           setRoomViewActive(false)
           setIsScreenSharing(false)
-          setRemoteScreenSharing(false)
+          setRemoteScreenSharer(null)
         }
-        if (!state.isScreenSharing && !state.remoteScreenSharing) {
+        if (!state.isScreenSharing && !state.remoteScreenSharer) {
           if (remoteScreenVideoRef.current) {
             remoteScreenVideoRef.current.srcObject = null
             remoteScreenVideoRef.current.pause()
@@ -798,7 +802,7 @@ const MainMsnMessengerWindow: React.FC = () => {
         setInCall(false)
         setCallHealth('dead')
         setIsScreenSharing(false)
-        setRemoteScreenSharing(false)
+        setRemoteScreenSharer(null)
         window.msnApi?.showNativeNotification?.(
           'MSN Privado - Ligação Encerrada',
           `A ligação caiu ou foi encerrada: ${reason}`
@@ -817,10 +821,25 @@ const MainMsnMessengerWindow: React.FC = () => {
           }
         ])
       },
+      onFriendDroppedFromCall: (friend, reason) => {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `drop-${friend}-${Date.now()}`,
+            sender: friend,
+            text: `⚠️ ${friend} caiu da ligação (${reason}). Você continua na sala.`,
+            isSystem: true,
+            timestamp: nowTimeLabel()
+          }
+        ])
+      },
       onStreamsUpdated: (streams) => {
         streamsRef.current = streams
         setHasLocalCam(Boolean(streams.localCam && streams.localCam.getVideoTracks().length > 0))
-        setHasRemoteCam(Boolean(streams.remoteCam && streams.remoteCam.getVideoTracks().length > 0))
+        const withCam = ALL_USERS.filter((f) => (streams.remotes[f]?.cam?.getVideoTracks().length || 0) > 0)
+        setRemoteCamFriends((prev) =>
+          prev.length === withCam.length && prev.every((f) => withCam.includes(f)) ? prev : withCam
+        )
         syncMediaElementsRef.current()
       },
       onVoiceActivityChange: (speaking) => {
@@ -1066,7 +1085,7 @@ const MainMsnMessengerWindow: React.FC = () => {
       {
         id: `nudge-me-${Date.now()}`,
         sender: loggedInUser,
-        text: `🔔 Você acabou de chamar a atenção de ${friendUser}!`,
+        text: `🔔 Você acabou de chamar a atenção de ${joinNames(onlineFriends.length ? onlineFriends : [friendUser])}!`,
         isSystem: true,
         timestamp: new Date().toLocaleTimeString('pt-BR', {
           hour: '2-digit',
@@ -1179,33 +1198,28 @@ const MainMsnMessengerWindow: React.FC = () => {
     : 'opacity-0 pointer-events-none'
 
   // Arrastar Câmeras nos Cantos na Tela 4
-  const startDraggingCornerCam = (
-    target: 'my' | 'friend',
-    e: React.MouseEvent<HTMLDivElement>
-  ): void => {
+  const startDraggingCornerCam = (target: CornerCamKey, e: React.MouseEvent<HTMLDivElement>): void => {
     e.stopPropagation()
-    const currentPos = target === 'my' ? myCornerCamPos : friendCornerCamPos
+    const layout = cornerCams[target]
     draggingCamRef.current = {
       target,
-      offsetX: e.clientX - currentPos.x,
-      offsetY: e.clientY - currentPos.y,
-      width: target === 'my' ? myCornerCamWidth : friendCornerCamWidth
+      offsetX: e.clientX - layout.x,
+      offsetY: e.clientY - layout.y,
+      width: layout.width
     }
   }
 
   // Redimensionar Câmeras nos Cantos na Tela 4 (alça no canto inferior direito)
-  const startResizingCornerCam = (
-    target: 'my' | 'friend',
-    e: React.MouseEvent<HTMLDivElement>
-  ): void => {
+  const startResizingCornerCam = (target: CornerCamKey, e: React.MouseEvent<HTMLDivElement>): void => {
     e.stopPropagation()
     e.preventDefault()
+    const layout = cornerCams[target]
     resizingCamRef.current = {
       target,
       startX: e.clientX,
       startY: e.clientY,
-      startWidth: target === 'my' ? myCornerCamWidth : friendCornerCamWidth,
-      pos: target === 'my' ? myCornerCamPos : friendCornerCamPos
+      startWidth: layout.width,
+      pos: { x: layout.x, y: layout.y }
     }
   }
 
@@ -1216,12 +1230,17 @@ const MainMsnMessengerWindow: React.FC = () => {
     return Math.round(Math.max(CORNER_CAM_MIN_WIDTH, Math.min(max, width)))
   }
 
+  const updateCornerCam = (target: CornerCamKey, patch: Partial<CornerCamLayout>): void => {
+    setCornerCams((prev) => ({ ...prev, [target]: { ...prev[target], ...patch } }))
+  }
+
   // Rodinha do mouse sobre a câmera também aumenta/diminui
-  const handleCornerCamWheel = (target: 'my' | 'friend', e: React.WheelEvent<HTMLDivElement>): void => {
-    const pos = target === 'my' ? myCornerCamPos : friendCornerCamPos
-    const setWidth = target === 'my' ? setMyCornerCamWidth : setFriendCornerCamWidth
+  const handleCornerCamWheel = (target: CornerCamKey, e: React.WheelEvent<HTMLDivElement>): void => {
     const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1
-    setWidth((prev) => clampCornerCamWidth(prev * factor, pos))
+    setCornerCams((prev) => {
+      const layout = prev[target]
+      return { ...prev, [target]: { ...layout, width: clampCornerCamWidth(layout.width * factor, layout) } }
+    })
   }
 
   useEffect(() => {
@@ -1230,24 +1249,18 @@ const MainMsnMessengerWindow: React.FC = () => {
       if (resizing) {
         const dx = e.clientX - resizing.startX
         const dy = ((e.clientY - resizing.startY) * 16) / 9
-        const nextWidth = clampCornerCamWidth(resizing.startWidth + Math.max(dx, dy), resizing.pos)
-        if (resizing.target === 'my') {
-          setMyCornerCamWidth(nextWidth)
-        } else {
-          setFriendCornerCamWidth(nextWidth)
-        }
+        updateCornerCam(resizing.target, {
+          width: clampCornerCamWidth(resizing.startWidth + Math.max(dx, dy), resizing.pos)
+        })
         return
       }
       const dragging = draggingCamRef.current
       if (!dragging) return
       const height = (dragging.width * 9) / 16
-      const nextX = Math.max(8, Math.min(window.innerWidth - dragging.width - 8, e.clientX - dragging.offsetX))
-      const nextY = Math.max(8, Math.min(window.innerHeight - height - 8, e.clientY - dragging.offsetY))
-      if (dragging.target === 'my') {
-        setMyCornerCamPos({ x: nextX, y: nextY })
-      } else {
-        setFriendCornerCamPos({ x: nextX, y: nextY })
-      }
+      updateCornerCam(dragging.target, {
+        x: Math.max(8, Math.min(window.innerWidth - dragging.width - 8, e.clientX - dragging.offsetX)),
+        y: Math.max(8, Math.min(window.innerHeight - height - 8, e.clientY - dragging.offsetY))
+      })
     }
     const onMouseUp = (): void => {
       draggingCamRef.current = null
@@ -1303,7 +1316,7 @@ const MainMsnMessengerWindow: React.FC = () => {
           <div className="grid grid-cols-2 gap-4">
             {(['Vitinho', 'Will'] as MsnUser[]).map((user) => {
               const isSelected = selectedLoginUser === user
-              const avatar = user === 'Vitinho' ? AVATAR_VITINHO : AVATAR_WILL
+              const avatar = USER_AVATARS[user]
               return (
                 <button
                   key={user}
@@ -1435,13 +1448,128 @@ const MainMsnMessengerWindow: React.FC = () => {
   }
 
   const isCinemaScreenMode = inCall && roomViewActive && (isScreenSharing || remoteScreenSharing)
-  const myAvatar = loggedInUser === 'Vitinho' ? AVATAR_VITINHO : AVATAR_WILL
-  const friendAvatar = friendUser === 'Vitinho' ? AVATAR_VITINHO : AVATAR_WILL
+  const myAvatar = USER_AVATARS[loggedInUser]
+  const roomFriends = friendsInRoom
+  const cinemaFriends: MsnUser[] = friendsInRoom.length > 0 ? friendsInRoom : [friendUser]
+
+  const enterRoom = (): void => {
+    setRoomViewActive(true)
+    webrtcRef.current?.startCall(true)
+  }
+
+  // Moldura de perfil no chat (mostra a webcam ao vivo quando a pessoa está na sala)
+  const renderFriendFrame = (friend: MsnUser): React.ReactElement => {
+    const status = presence[friend].status
+    const inRoom = friendsInRoom.includes(friend)
+    const hasCam = remoteCamFriends.includes(friend)
+    const color = USER_COLORS[friend]
+    return (
+      <div className="flex flex-col items-center gap-1.5 w-full">
+        <div
+          onClick={() => {
+            if (inRoom && !inCall) {
+              enterRoom()
+            } else if (inCall) {
+              setRoomViewActive(true)
+            }
+          }}
+          className={`msn-avatar-frame p-1.5 rounded-2xl relative overflow-hidden transition-all ${
+            hasCam ? `${isNathVisible ? 'w-44' : 'w-48'} aspect-video cursor-pointer` : isNathVisible ? 'w-28 h-28' : 'w-36 h-36'
+          }`}
+          style={hasCam || friend === 'Nath' ? { outline: `2px solid ${color.hex}`, outlineOffset: 1 } : undefined}
+          title={inRoom ? `${friend} está na Sala! Clique para entrar na Sala.` : friend}
+        >
+          {hasCam ? (
+            <video
+              ref={bindRemoteCamRefs[friend]}
+              autoPlay
+              playsInline
+              muted
+              className="w-full h-full rounded-xl object-contain bg-black"
+            />
+          ) : (
+            <img src={USER_AVATARS[friend]} alt={friend} className="w-full h-full rounded-xl object-cover" />
+          )}
+          <span
+            className={`absolute bottom-2.5 right-2.5 w-3.5 h-3.5 rounded-full border-2 border-white ${
+              status === 'online' ? 'bg-[#52b700]' : status === 'busy' ? 'bg-[#d93025]' : 'bg-[#8e99a4]'
+            }`}
+          />
+          {inRoom && (
+            <span className="absolute top-2 left-2 px-1.5 py-0.5 rounded bg-[#3a8d00]/90 text-white text-[9px] font-extrabold shadow">
+              🟢 NA SALA
+            </span>
+          )}
+        </div>
+        <span className={`text-xs font-extrabold ${friend === 'Nath' ? color.text : 'text-[#164273]'}`}>{friend}</span>
+        {inRoom && !inCall && (
+          <button
+            type="button"
+            onClick={enterRoom}
+            className="px-2.5 py-1 rounded-lg bg-[#52b700] hover:brightness-110 text-white text-[11px] font-extrabold shadow"
+          >
+            Entrar na Sala
+          </button>
+        )}
+      </div>
+    )
+  }
+
+  // Câmera de canto no Modo Cinema (arrastável; alça/rodinha para redimensionar)
+  const renderCornerCam = (key: CornerCamKey): React.ReactElement => {
+    const layout = cornerCams[key]
+    const isMine = key === 'me'
+    const label = isMine ? `${loggedInUser} (Você)` : key
+    const borderHex = isMine ? USER_COLORS[loggedInUser].hex : USER_COLORS[key as MsnUser].hex
+    return (
+      <div
+        key={key}
+        onMouseDown={(e) => startDraggingCornerCam(key, e)}
+        onWheel={(e) => handleCornerCamWheel(key, e)}
+        onClick={(e) => e.stopPropagation()}
+        style={{ left: layout.x, top: layout.y, width: layout.width, borderColor: borderHex }}
+        className="group absolute z-20 aspect-video rounded-xl overflow-hidden border-2 bg-black shadow-2xl cursor-move"
+        title={`Arraste para mover a câmera de ${isMine ? 'você' : key} • Puxe o canto ou use a rodinha do mouse para redimensionar`}
+      >
+        <video
+          ref={isMine ? bindLocalCamRef : bindRemoteCamRefs[key as MsnUser]}
+          autoPlay
+          playsInline
+          muted
+          className="w-full h-full object-contain bg-black"
+        />
+        <span className="absolute bottom-1.5 left-2 px-1.5 py-0.5 rounded bg-black/70 text-white text-[10px] font-bold">
+          {label}
+        </span>
+        {/* Alça de redimensionar (arraste o canto) — a rodinha do mouse também aumenta/diminui */}
+        <div
+          onMouseDown={(e) => startResizingCornerCam(key, e)}
+          onClick={(e) => e.stopPropagation()}
+          className="absolute bottom-0 right-0 w-5 h-5 cursor-nwse-resize opacity-0 group-hover:opacity-100 transition-opacity"
+          title="Arraste para aumentar ou diminuir"
+        >
+          <svg viewBox="0 0 20 20" className="w-full h-full text-white/90 drop-shadow">
+            <path d="M18 8 L8 18 M18 13 L13 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+          </svg>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="h-screen w-screen msn-window-bg flex flex-col overflow-hidden select-none">
       {/* ELEMENTO <audio id="remote-voice"> REPRODUZ A VOZ DO AMIGO NATIVAMENTE */}
-      <audio id="remote-voice" ref={remoteVoiceAudioRef} autoPlay playsInline />
+      {otherUsers.map((friend) => (
+        <audio
+          key={friend}
+          id={`remote-voice-${friend}`}
+          ref={(el) => {
+            remoteVoiceAudioRefs.current[friend] = el
+          }}
+          autoPlay
+          playsInline
+        />
+      ))}
 
       {/* ELEMENTO <audio id="remote-screen-audio"> REPRODUZ O ÁUDIO DO SISTEMA/FILME NATIVAMENTE SEM ENGASGOS */}
       <audio id="remote-screen-audio" ref={remoteScreenAudioRef} autoPlay playsInline />
@@ -1576,6 +1704,24 @@ const MainMsnMessengerWindow: React.FC = () => {
               </div>
             )}
           </div>
+
+          {/* A Nath só aparece no cabeçalho quando está online */}
+          {isNathVisible && (
+            <div
+              className="flex items-center gap-1.5 pl-3 ml-1 border-l border-white/25 min-w-0"
+              title={`Status de Nath: ${nathStatus.toUpperCase()}`}
+            >
+              <span
+                className={`w-3 h-3 rounded-full border-2 border-white shadow shrink-0 ${
+                  nathStatus === 'busy' ? 'bg-[#d93025]' : 'bg-[#ec4899]'
+                }`}
+              />
+              <span className="font-extrabold text-sm tracking-wide text-pink-100">Nath</span>
+              {presence.Nath.subnick && presence.Nath.subnick !== 'Offline' && (
+                <span className="text-xs text-pink-100/80 truncate max-w-[10rem]">{presence.Nath.subnick}</span>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Meu Status + Subnick Musical Automático */}
@@ -1635,7 +1781,7 @@ const MainMsnMessengerWindow: React.FC = () => {
               if (inCall) {
                 setRoomViewActive(false)
                 setIsScreenSharing(false)
-                setRemoteScreenSharing(false)
+                setRemoteScreenSharer(null)
                 webrtcRef.current?.rejectOrHangupCall()
               } else {
                 setRoomViewActive(true)
@@ -1659,7 +1805,9 @@ const MainMsnMessengerWindow: React.FC = () => {
               <>
                 <Video className="w-4 h-4 text-[#2664a5]" />
                 <span>
-                  {friendInRoom ? `Entrar na Sala (${friendUser} está lá!)` : 'Entrar na Sala'}
+                  {friendInRoom
+                    ? `Entrar na Sala (${friendsInRoomLabel} ${friendsInRoom.length > 1 ? 'estão' : 'está'} lá!)`
+                    : 'Entrar na Sala'}
                 </span>
               </>
             )}
@@ -1815,7 +1963,8 @@ const MainMsnMessengerWindow: React.FC = () => {
           <div className="flex items-center gap-2 text-xs font-bold">
             <span className="w-2.5 h-2.5 rounded-full bg-[#76ff03] animate-ping" />
             <span>
-              🟢 {friendUser} está na Sala agora! A câmera dele aparece ali no quadrado do chat — entre quando quiser!
+              🟢 {friendsInRoomLabel} {friendsInRoom.length > 1 ? 'estão' : 'está'} na Sala agora! A câmera
+              aparece ali no quadrado do chat — entre quando quiser!
             </span>
           </div>
           <button
@@ -1867,69 +2016,9 @@ const MainMsnMessengerWindow: React.FC = () => {
                 }`}
               />
 
-              {/* Câmera 1 no Canto Superior (Arrastável / Draggable): Minha Câmera Full Widescreen (sem corte quadrado) */}
-              <div
-                onMouseDown={(e) => startDraggingCornerCam('my', e)}
-                onWheel={(e) => handleCornerCamWheel('my', e)}
-                onClick={(e) => e.stopPropagation()}
-                style={{ left: myCornerCamPos.x, top: myCornerCamPos.y, width: myCornerCamWidth }}
-                className="group absolute z-20 aspect-video rounded-xl overflow-hidden border-2 border-[#4facfe] bg-black shadow-2xl cursor-move"
-                title="Arraste para mover • Puxe o canto ou use a rodinha do mouse para redimensionar"
-              >
-                <video
-                  ref={bindLocalCamRef}
-                  autoPlay
-                  playsInline
-                  muted
-                  className="w-full h-full object-contain bg-black"
-                />
-                <span className="absolute bottom-1.5 left-2 px-1.5 py-0.5 rounded bg-black/70 text-white text-[10px] font-bold">
-                  {loggedInUser} (Você)
-                </span>
-                {/* Alça de redimensionar (arraste o canto) — a rodinha do mouse também aumenta/diminui */}
-                <div
-                  onMouseDown={(e) => startResizingCornerCam('my', e)}
-                  onClick={(e) => e.stopPropagation()}
-                  className="absolute bottom-0 right-0 w-5 h-5 cursor-nwse-resize opacity-0 group-hover:opacity-100 transition-opacity"
-                  title="Arraste para aumentar ou diminuir"
-                >
-                  <svg viewBox="0 0 20 20" className="w-full h-full text-white/90 drop-shadow">
-                    <path d="M18 8 L8 18 M18 13 L13 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                  </svg>
-                </div>
-              </div>
-
-              {/* Câmera 2 no Canto Superior (Arrastável / Draggable): Câmera do Amigo Full Widescreen (sem corte quadrado) */}
-              <div
-                onMouseDown={(e) => startDraggingCornerCam('friend', e)}
-                onWheel={(e) => handleCornerCamWheel('friend', e)}
-                onClick={(e) => e.stopPropagation()}
-                style={{ left: friendCornerCamPos.x, top: friendCornerCamPos.y, width: friendCornerCamWidth }}
-                className="group absolute z-20 aspect-video rounded-xl overflow-hidden border-2 border-[#52b700] bg-black shadow-2xl cursor-move"
-                title={`Arraste para mover a câmera de ${friendUser} • Puxe o canto ou use a rodinha para redimensionar`}
-              >
-                <video
-                  ref={bindRemoteCamRef}
-                  autoPlay
-                  playsInline
-                  muted
-                  className="w-full h-full object-contain bg-black"
-                />
-                <span className="absolute bottom-1.5 left-2 px-1.5 py-0.5 rounded bg-black/70 text-white text-[10px] font-bold">
-                  {friendUser}
-                </span>
-                {/* Alça de redimensionar (arraste o canto) — a rodinha do mouse também aumenta/diminui */}
-                <div
-                  onMouseDown={(e) => startResizingCornerCam('friend', e)}
-                  onClick={(e) => e.stopPropagation()}
-                  className="absolute bottom-0 right-0 w-5 h-5 cursor-nwse-resize opacity-0 group-hover:opacity-100 transition-opacity"
-                  title="Arraste para aumentar ou diminuir"
-                >
-                  <svg viewBox="0 0 20 20" className="w-full h-full text-white/90 drop-shadow">
-                    <path d="M18 8 L8 18 M18 13 L13 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                  </svg>
-                </div>
-              </div>
+              {/* Câmeras de canto (arrastáveis e redimensionáveis): a minha + uma por amigo na sala */}
+              {renderCornerCam('me')}
+              {cinemaFriends.map((friend) => renderCornerCam(friend))}
 
               {/* Botão Rápido de Tela Cheia no Canto Superior Direito (Modo Cinema) */}
               <div
@@ -2016,7 +2105,7 @@ const MainMsnMessengerWindow: React.FC = () => {
                   {/* Slider 1: Volume da Voz do Amigo (Boost Web Audio API até 200%) */}
                   <div className="flex items-center gap-2 px-2 border-l border-slate-700">
                     <span className="text-[11px] font-bold text-sky-300 whitespace-nowrap">
-                      🎤 Voz {friendUser}:
+                      🎤 Voz {friendsInRoom.length > 1 ? 'dos amigos' : friendsInRoom[0] || friendUser}:
                     </span>
                     <input
                       type="range"
@@ -2105,7 +2194,7 @@ const MainMsnMessengerWindow: React.FC = () => {
                     onClick={() => {
                       setRoomViewActive(false)
                       setIsScreenSharing(false)
-                      setRemoteScreenSharing(false)
+                      setRemoteScreenSharer(null)
                       webrtcRef.current?.rejectOrHangupCall()
                     }}
                     className="px-3.5 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold flex items-center gap-1.5"
@@ -2168,17 +2257,41 @@ const MainMsnMessengerWindow: React.FC = () => {
                 </button>
               </div>
 
-              {/* Câmera do Amigo em proporção natural Full (object-contain) */}
-              <video
-                ref={bindRemoteCamRef}
-                autoPlay
-                playsInline
-                muted
-                className="w-full h-full object-contain bg-slate-950"
-              />
+              {/* Câmera de cada amigo na sala em proporção natural (object-contain): 1 amigo ocupa
+                  a tela toda; com a Nath, os dois dividem a tela lado a lado */}
+              {roomFriends.length > 1 ? (
+                <div className="w-full h-full grid grid-cols-2 gap-2 p-2">
+                  {roomFriends.map((friend) => (
+                    <div
+                      key={friend}
+                      className="relative rounded-xl overflow-hidden bg-black border-2"
+                      style={{ borderColor: USER_COLORS[friend].hex }}
+                    >
+                      <video
+                        ref={bindRemoteCamRefs[friend]}
+                        autoPlay
+                        playsInline
+                        muted
+                        className="w-full h-full object-contain bg-black"
+                      />
+                      <span className="absolute bottom-2 left-2 px-2 py-0.5 rounded bg-black/70 text-white text-[11px] font-bold">
+                        {friend}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <video
+                  ref={bindRemoteCamRefs[roomFriends[0] || friendUser]}
+                  autoPlay
+                  playsInline
+                  muted
+                  className="w-full h-full object-contain bg-slate-950"
+                />
+              )}
 
-              {/* Aviso quando você está na Sala aguardando o amigo entrar */}
-              {!friendInRoom && !hasRemoteCam && (
+              {/* Aviso quando você está na Sala aguardando alguém entrar */}
+              {!friendInRoom && remoteCamFriends.length === 0 && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none z-10 p-4 text-center">
                   <div className="px-6 py-4 rounded-2xl bg-slate-900/85 border border-slate-700 shadow-2xl space-y-2 max-w-md pointer-events-auto">
                     <div className="flex items-center justify-center gap-2 text-emerald-400 font-extrabold text-sm">
@@ -2186,7 +2299,9 @@ const MainMsnMessengerWindow: React.FC = () => {
                       <span>Você está na Sala!</span>
                     </div>
                     <p className="text-xs text-slate-300">
-                      Sua webcam já está aparecendo ao vivo no quadrado do chat para <strong>{friendUser}</strong>. Assim que ele clicar em <strong>Entrar na Sala</strong>, vocês já começam a conversar!
+                      Sua webcam já está aparecendo ao vivo no quadrado do chat para{' '}
+                      <strong>{joinNames(onlineFriends.length ? onlineFriends : [friendUser])}</strong>. Assim que
+                      alguém clicar em <strong>Entrar na Sala</strong>, vocês já começam a conversar!
                     </p>
                     <button
                       type="button"
@@ -2330,7 +2445,7 @@ const MainMsnMessengerWindow: React.FC = () => {
                   onClick={() => {
                     setRoomViewActive(false)
                     setIsScreenSharing(false)
-                    setRemoteScreenSharing(false)
+                    setRemoteScreenSharer(null)
                     webrtcRef.current?.rejectOrHangupCall()
                   }}
                   className="px-3.5 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold flex items-center gap-1.5"
@@ -2366,7 +2481,7 @@ const MainMsnMessengerWindow: React.FC = () => {
                   {messages.length === 0 ? (
                     <div className="h-full flex flex-col items-center justify-center text-center text-xs text-slate-400 space-y-1">
                       <p className="font-bold text-slate-500">
-                        Conversa privada P2P iniciada com {friendUser}.
+                        Conversa privada P2P iniciada com {joinNames(isNathVisible ? [friendUser, 'Nath'] : [friendUser])}.
                       </p>
                       <p>
                         Você pode colar prints da área de transferência (<strong>Ctrl+V</strong>) ou
@@ -2392,7 +2507,7 @@ const MainMsnMessengerWindow: React.FC = () => {
                           <div className="flex items-baseline gap-1.5">
                             <span
                               className={`text-xs font-bold ${
-                                isMe ? 'text-[#1d528d]' : 'text-[#286b00]'
+                                isMe ? 'text-[#1d528d]' : USER_COLORS[m.sender]?.text || 'text-[#286b00]'
                               }`}
                             >
                               {m.sender} diz:
@@ -2501,7 +2616,7 @@ const MainMsnMessengerWindow: React.FC = () => {
                         handleSendText(e)
                       }
                     }}
-                    placeholder={`Digite uma mensagem para ${friendUser} ou pressione Ctrl+V para colar um print...`}
+                    placeholder={`Digite uma mensagem para ${joinNames(isNathVisible ? [friendUser, 'Nath'] : [friendUser])} ou pressione Ctrl+V para colar um print...`}
                     className="flex-1 resize-none text-xs text-slate-900 placeholder-slate-400 focus:outline-none p-1"
                   />
                   <button
@@ -2517,71 +2632,10 @@ const MainMsnMessengerWindow: React.FC = () => {
               {/* COLUNA DA DIREITA (MOLDURAS DO CHAT: MOSTRA A WEBCAM AO VIVO DE QUEM ESTIVER NA SALA!) */}
               <div className="w-52 shrink-0 flex flex-col justify-between items-center py-1">
                 {/* Moldura Superior: Amigo (Mostra a Webcam Full ao vivo quando ele está na Sala!) */}
-                <div className="flex flex-col items-center gap-1.5 w-full">
-                  <div
-                    onClick={() => {
-                      if (friendInRoom && !inCall) {
-                        setRoomViewActive(true)
-                        webrtcRef.current?.startCall(true)
-                      } else if (inCall) {
-                        setRoomViewActive(true)
-                      }
-                    }}
-                    className={`msn-avatar-frame p-1.5 rounded-2xl relative overflow-hidden transition-all ${
-                      hasRemoteCam
-                        ? 'w-48 aspect-video cursor-pointer ring-2 ring-[#52b700]'
-                        : 'w-36 h-36'
-                    }`}
-                    title={
-                      friendInRoom
-                        ? `${friendUser} está na Sala! Clique para entrar na Sala.`
-                        : friendUser
-                    }
-                  >
-                    {hasRemoteCam ? (
-                      <video
-                        ref={bindRemoteCamRef}
-                        autoPlay
-                        playsInline
-                        muted
-                        className="w-full h-full rounded-xl object-contain bg-black"
-                      />
-                    ) : (
-                      <img
-                        src={friendAvatar}
-                        alt={friendUser}
-                        className="w-full h-full rounded-xl object-cover"
-                      />
-                    )}
-                    <span
-                      className={`absolute bottom-2.5 right-2.5 w-3.5 h-3.5 rounded-full border-2 border-white ${
-                        friendStatus === 'online'
-                          ? 'bg-[#52b700]'
-                          : friendStatus === 'busy'
-                            ? 'bg-[#d93025]'
-                            : 'bg-[#8e99a4]'
-                      }`}
-                    />
-                    {friendInRoom && (
-                      <span className="absolute top-2 left-2 px-1.5 py-0.5 rounded bg-[#3a8d00]/90 text-white text-[9px] font-extrabold shadow">
-                        🟢 NA SALA
-                      </span>
-                    )}
-                  </div>
-                  <span className="text-xs font-extrabold text-[#164273]">{friendUser}</span>
-                  {friendInRoom && !inCall && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setRoomViewActive(true)
-                        webrtcRef.current?.startCall(true)
-                      }}
-                      className="px-2.5 py-1 rounded-lg bg-[#52b700] hover:brightness-110 text-white text-[11px] font-extrabold shadow"
-                    >
-                      Entrar na Sala
-                    </button>
-                  )}
-                </div>
+                {renderFriendFrame(friendUser)}
+
+                {/* Moldura do Meio: Nath em rosa — só aparece quando ela está online */}
+                {isNathVisible && renderFriendFrame('Nath')}
 
                 {/* Moldura Inferior: Você (Mostra sua Webcam Full ao vivo quando você está na Sala!) */}
                 <div className="flex flex-col items-center gap-1.5 w-full">
@@ -2591,9 +2645,16 @@ const MainMsnMessengerWindow: React.FC = () => {
                     }}
                     className={`msn-avatar-frame p-1.5 rounded-2xl relative overflow-hidden transition-all ${
                       inCall && hasLocalCam
-                        ? 'w-48 aspect-video cursor-pointer ring-2 ring-[#4facfe]'
-                        : 'w-36 h-36'
+                        ? `${isNathVisible ? 'w-44' : 'w-48'} aspect-video cursor-pointer`
+                        : isNathVisible
+                          ? 'w-28 h-28'
+                          : 'w-36 h-36'
                     }`}
+                    style={
+                      inCall && hasLocalCam
+                        ? { outline: `2px solid ${USER_COLORS[loggedInUser].hex}`, outlineOffset: 1 }
+                        : undefined
+                    }
                   >
                     {inCall && hasLocalCam ? (
                       <video

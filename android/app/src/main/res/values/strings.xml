@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Vitinho e Will</string>
+    <string name="title_activity_main">Vitinho e Will</string>
+    <string name="package_name">com.vitinhowill.msnprivado.tablet</string>
+    <string name="custom_url_scheme">com.vitinhowill.msnprivado.tablet</string>
+</resources>

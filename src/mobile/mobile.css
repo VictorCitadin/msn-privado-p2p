@@ -1,0 +1,22 @@
+/* Ajustes do app do tablet (Android / Capacitor) */
+html,
+body,
+#root {
+  height: 100%;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* "Chamar atenção": a tela treme como a janela do MSN no PC */
+@keyframes mobileNudge {
+  0%, 100% { transform: translate(0, 0); }
+  15% { transform: translate(-10px, 4px); }
+  30% { transform: translate(9px, -5px); }
+  45% { transform: translate(-8px, -3px); }
+  60% { transform: translate(7px, 5px); }
+  75% { transform: translate(-5px, 2px); }
+  90% { transform: translate(4px, -2px); }
+}
+.mobile-nudge {
+  animation: mobileNudge 0.6s ease-in-out;
+}

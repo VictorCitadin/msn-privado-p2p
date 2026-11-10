@@ -12,5 +12,5 @@
     "resolveJsonModule": true,
     "types": ["electron-vite/node", "node"]
   },
-  "include": ["electron.vite.config.*", "src/main/**/*", "src/preload/**/*", "api/**/*"]
+  "include": ["electron.vite.config.*", "vite.mobile.config.*", "capacitor.config.*", "src/main/**/*", "src/preload/**/*", "api/**/*"]
 }

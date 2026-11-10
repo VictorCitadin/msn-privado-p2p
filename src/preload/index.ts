@@ -50,7 +50,7 @@ export interface AlbumRankingRecord {
 
 export interface StoredChatMessage {
   id: string
-  sender: 'Vitinho' | 'Will'
+  sender: 'Vitinho' | 'Will' | 'Nath'
   text?: string
   imageDataUrl?: string
   isSystem?: boolean
@@ -60,7 +60,7 @@ export interface StoredChatMessage {
 const msnApi = {
   // Sessão local, dispositivos e histórico de mensagens
   getSession: (): Promise<{
-    sessionUser: 'Vitinho' | 'Will' | null
+    sessionUser: 'Vitinho' | 'Will' | 'Nath' | null
     subnick: string
     ecoMode: boolean
     audioDeviceId: string
@@ -69,7 +69,7 @@ const msnApi = {
   }> => ipcRenderer.invoke('store:get-session'),
 
   setSession: (payload: {
-    sessionUser?: 'Vitinho' | 'Will' | null
+    sessionUser?: 'Vitinho' | 'Will' | 'Nath' | null
     subnick?: string
     ecoMode?: boolean
     audioDeviceId?: string

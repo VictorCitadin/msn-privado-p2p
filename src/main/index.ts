@@ -79,7 +79,7 @@ export interface AlbumRankingRecord {
 
 export interface StoredChatMessage {
   id: string
-  sender: 'Vitinho' | 'Will'
+  sender: 'Vitinho' | 'Will' | 'Nath'
   text?: string
   imageDataUrl?: string
   isSystem?: boolean
@@ -87,7 +87,7 @@ export interface StoredChatMessage {
 }
 
 interface StoreSchema {
-  sessionUser: 'Vitinho' | 'Will' | null
+  sessionUser: 'Vitinho' | 'Will' | 'Nath' | null
   subnick: string
   ecoMode: boolean
   audioDeviceId: string
@@ -1020,7 +1020,7 @@ function registerIpcHandlers(): void {
     (
       _event,
       payload: {
-        sessionUser: 'Vitinho' | 'Will' | null
+        sessionUser: 'Vitinho' | 'Will' | 'Nath' | null
         subnick?: string
         ecoMode?: boolean
         audioDeviceId?: string

@@ -23,7 +23,8 @@ import type {
   AlbumSearchResult,
   AlbumTrackItem
 } from '../../../preload/index'
-import type { MsnUser } from '../services/webrtc'
+// O Rankeador de Álbuns é só de Vitinho e Will
+type RankerUser = 'Vitinho' | 'Will'
 
 type RankerSubView = 'list' | 'create-edit' | 'compare'
 
@@ -142,7 +143,7 @@ function calculateCompatibilityPercentage(
 }
 
 export const AlbumRankerWindow: React.FC = () => {
-  const [currentUser, setCurrentUser] = useState<MsnUser>('Vitinho')
+  const [currentUser, setCurrentUser] = useState<RankerUser>('Vitinho')
   const [subView, setSubView] = useState<RankerSubView>('list')
   const [rankings, setRankings] = useState<AlbumRankingRecord[]>([])
   const [loadingRankings, setLoadingRankings] = useState<boolean>(true)
@@ -205,7 +206,7 @@ export const AlbumRankerWindow: React.FC = () => {
     setLoadingRankings(true)
     try {
       const session = await window.msnApi.getSession()
-      if (session.sessionUser) {
+      if (session.sessionUser === 'Vitinho' || session.sessionUser === 'Will') {
         setCurrentUser(session.sessionUser)
       }
       const list = await window.msnApi.listAlbumRankings()
@@ -413,7 +414,7 @@ export const AlbumRankerWindow: React.FC = () => {
         <div className="flex items-center gap-3">
           <div className="flex items-center bg-slate-900/80 p-1 rounded-lg border border-slate-600 text-xs">
             <span className="px-2 text-slate-400">Avaliando como:</span>
-            {(['Vitinho', 'Will'] as MsnUser[]).map((u) => (
+            {(['Vitinho', 'Will'] as RankerUser[]).map((u) => (
               <button
                 key={u}
                 type="button"
