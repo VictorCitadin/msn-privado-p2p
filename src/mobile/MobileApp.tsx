@@ -10,7 +10,11 @@ import {
   SwitchCamera,
   Video,
   VideoOff,
-  Download
+  Download,
+  Maximize2,
+  Minimize2,
+  Eye,
+  EyeOff
 } from 'lucide-react'
 import {
   ALL_USERS,
@@ -23,6 +27,7 @@ import {
 } from '../renderer/src/services/webrtc'
 import { soundManager } from '../renderer/src/services/soundManager'
 import { USER_AVATARS, USER_COLORS, joinNames } from '../renderer/src/services/avatars'
+import { EXIT_FULLSCREEN_EVENT, enterImmersive, exitImmersive, setKeepAwake } from './immersive'
 
 /**
  * Vitinho e Will — app do tablet (Android).
@@ -216,6 +221,8 @@ const MessengerScreen: React.FC<{ user: MsnUser; onLogout: () => void }> = ({ us
   const [isMicMuted, setIsMicMuted] = useState(false)
   const [isCamEnabled, setIsCamEnabled] = useState(true)
   const [streamsVersion, setStreamsVersion] = useState(0)
+  // Tela cheia da sala (filmes no compartilhamento de tela): esconde toda a interface do app
+  const [fullscreen, setFullscreen] = useState(false)
 
   const serviceRef = useRef<MsnWebRTCService | null>(null)
   const streamsRef = useRef<{
@@ -346,8 +353,30 @@ const MessengerScreen: React.FC<{ user: MsnUser; onLogout: () => void }> = ({ us
     if (!inCall) {
       setIsMicMuted(false)
       setIsCamEnabled(true)
+      setFullscreen(false)
     }
+    // Tela acesa durante a ligação: com a tela apagada o Android pode derrubar a chamada
+    setKeepAwake(inCall)
   }, [friendsInRoom.length, inCall])
+
+  // Tela cheia real (esconde as barras do Android) e botão voltar saindo da tela cheia
+  useEffect(() => {
+    if (fullscreen) {
+      enterImmersive()
+    } else {
+      exitImmersive()
+    }
+  }, [fullscreen])
+
+  useEffect(() => {
+    const onBack = (): void => setFullscreen(false)
+    window.addEventListener(EXIT_FULLSCREEN_EVENT, onBack)
+    return () => {
+      window.removeEventListener(EXIT_FULLSCREEN_EVENT, onBack)
+      exitImmersive()
+      setKeepAwake(false)
+    }
+  }, [])
 
   const sendText = (e?: React.FormEvent): void => {
     e?.preventDefault()
@@ -369,16 +398,59 @@ const MessengerScreen: React.FC<{ user: MsnUser; onLogout: () => void }> = ({ us
   const onlineFriends = friends.filter((f) => presence[f].status !== 'offline')
   const roomLabel = joinNames(friendsInRoom)
 
+  // Vozes dos amigos (um <audio> por pessoa) e áudio da tela compartilhada
+  const mediaSinks = (
+    <MediaSinks
+      friends={friends}
+      inCall={inCall}
+      remoteScreenSharer={remoteScreenSharer}
+      streamsRef={streamsRef}
+      version={streamsVersion}
+    />
+  )
+
+  const roomView = (
+    <RoomView
+      user={user}
+      inCall={inCall}
+      friendsInRoom={friendsInRoom}
+      remoteScreenSharer={remoteScreenSharer}
+      callHealth={callHealth}
+      streamsRef={streamsRef}
+      version={streamsVersion}
+      isMicMuted={isMicMuted}
+      isCamEnabled={isCamEnabled}
+      fullscreen={fullscreen}
+      onToggleFullscreen={() => setFullscreen((v) => !v)}
+      onEnter={() => serviceRef.current?.startCall(true)}
+      onLeave={() => serviceRef.current?.rejectOrHangupCall()}
+      onToggleMic={() => {
+        const muted = serviceRef.current?.toggleMicrophoneMute() ?? false
+        setIsMicMuted(muted)
+        soundManager.play(muted ? 'mute' : 'unmute')
+      }}
+      onToggleCam={async () => {
+        const enabled = (await serviceRef.current?.toggleCameraEnabled()) ?? true
+        setIsCamEnabled(enabled)
+      }}
+      onSwitchCamera={() => {
+        serviceRef.current?.switchToNextCamera().catch(() => {})
+      }}
+    />
+  )
+
+  if (fullscreen && inCall) {
+    return (
+      <div className={`h-screen w-screen bg-black overflow-hidden select-none ${shaking ? 'mobile-nudge' : ''}`}>
+        {mediaSinks}
+        {roomView}
+      </div>
+    )
+  }
+
   return (
     <div className={`h-screen w-screen msn-window-bg flex flex-col overflow-hidden select-none ${shaking ? 'mobile-nudge' : ''}`}>
-      {/* Vozes dos amigos (um <audio> por pessoa) e áudio da tela compartilhada */}
-      <MediaSinks
-        friends={friends}
-        inCall={inCall}
-        remoteScreenSharer={remoteScreenSharer}
-        streamsRef={streamsRef}
-        version={streamsVersion}
-      />
+      {mediaSinks}
 
       {/* CABEÇALHO */}
       <header className="msn-header-gradient px-4 py-2.5 text-white flex items-center justify-between shrink-0 pt-[max(0.625rem,env(safe-area-inset-top))]">
@@ -527,31 +599,7 @@ const MessengerScreen: React.FC<{ user: MsnUser; onLogout: () => void }> = ({ us
           </form>
         </div>
       ) : (
-        <RoomView
-          user={user}
-          inCall={inCall}
-          friendsInRoom={friendsInRoom}
-          remoteScreenSharer={remoteScreenSharer}
-          callHealth={callHealth}
-          streamsRef={streamsRef}
-          version={streamsVersion}
-          isMicMuted={isMicMuted}
-          isCamEnabled={isCamEnabled}
-          onEnter={() => serviceRef.current?.startCall(true)}
-          onLeave={() => serviceRef.current?.rejectOrHangupCall()}
-          onToggleMic={() => {
-            const muted = serviceRef.current?.toggleMicrophoneMute() ?? false
-            setIsMicMuted(muted)
-            soundManager.play(muted ? 'mute' : 'unmute')
-          }}
-          onToggleCam={async () => {
-            const enabled = (await serviceRef.current?.toggleCameraEnabled()) ?? true
-            setIsCamEnabled(enabled)
-          }}
-          onSwitchCamera={() => {
-            serviceRef.current?.switchToNextCamera().catch(() => {})
-          }}
-        />
+        roomView
       )}
     </div>
   )
@@ -647,6 +695,8 @@ const RoomView: React.FC<{
   version: number
   isMicMuted: boolean
   isCamEnabled: boolean
+  fullscreen: boolean
+  onToggleFullscreen: () => void
   onEnter: () => void
   onLeave: () => void
   onToggleMic: () => void
@@ -696,6 +746,10 @@ const RoomView: React.FC<{
     )
   }
 
+  if (props.fullscreen) {
+    return <FullscreenRoom {...props} screen={showScreen ? screen : null} />
+  }
+
   return (
     <div className="flex-1 relative bg-slate-950 overflow-hidden flex flex-col">
       {(callHealth === 'degraded' || callHealth === 'recovering') && (
@@ -706,11 +760,22 @@ const RoomView: React.FC<{
 
       <div className="flex-1 min-h-0 p-2 flex flex-col gap-2">
         {showScreen && (
-          <div className="flex-[3] min-h-0 relative rounded-xl overflow-hidden bg-black">
+          <div
+            className="flex-[3] min-h-0 relative rounded-xl overflow-hidden bg-black"
+            onDoubleClick={props.onToggleFullscreen}
+          >
             <StreamVideo stream={screen} className="w-full h-full object-contain" />
             <span className="absolute top-2 left-2 px-2 py-0.5 rounded bg-black/70 text-white text-xs font-bold">
               🖥️ Tela de {remoteScreenSharer}
             </span>
+            <button
+              type="button"
+              onClick={props.onToggleFullscreen}
+              className="absolute top-2 right-2 px-3 py-2 rounded-xl bg-black/70 border border-white/30 text-white text-sm font-bold flex items-center gap-1.5"
+            >
+              <Maximize2 className="w-4 h-4" />
+              Tela cheia
+            </button>
           </div>
         )}
 
@@ -769,11 +834,197 @@ const RoomView: React.FC<{
         </button>
         <button
           type="button"
+          onClick={props.onToggleFullscreen}
+          className="p-4 rounded-2xl border bg-slate-800 border-slate-600 text-white"
+          title="Tela cheia"
+        >
+          <Maximize2 className="w-6 h-6" />
+        </button>
+        <button
+          type="button"
           onClick={props.onLeave}
           className="px-6 py-4 rounded-2xl bg-red-600 border border-red-400 text-white font-extrabold flex items-center gap-2"
         >
           <PhoneOff className="w-6 h-6" />
           Sair
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// ============================================================================
+// SALA EM TELA CHEIA (FILMES): tela compartilhada ocupando tudo + câmeras pequenas no canto
+// ============================================================================
+const FULLSCREEN_CONTROLS_HIDE_MS = 4000
+
+const FullscreenRoom: React.FC<{
+  user: MsnUser
+  friendsInRoom: MsnUser[]
+  remoteScreenSharer: MsnUser | null
+  callHealth: string
+  streamsRef: React.MutableRefObject<{
+    localCam: MediaStream | null
+    remotes: Partial<Record<MsnUser, RemotePeerStreams>>
+  }>
+  screen: MediaStream | null
+  isMicMuted: boolean
+  isCamEnabled: boolean
+  onToggleFullscreen: () => void
+  onLeave: () => void
+  onToggleMic: () => void
+}> = (props) => {
+  const { user, friendsInRoom, remoteScreenSharer, callHealth, streamsRef, screen } = props
+  const remotes = streamsRef.current.remotes
+  const [camsVisible, setCamsVisible] = useState(true)
+  const [controlsVisible, setControlsVisible] = useState(true)
+  const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const showControls = useCallback(() => {
+    setControlsVisible(true)
+    if (hideTimer.current) clearTimeout(hideTimer.current)
+    hideTimer.current = setTimeout(() => setControlsVisible(false), FULLSCREEN_CONTROLS_HIDE_MS)
+  }, [])
+
+  useEffect(() => {
+    showControls()
+    return () => {
+      if (hideTimer.current) clearTimeout(hideTimer.current)
+    }
+  }, [showControls])
+
+  // Toque na tela: mostra/esconde os controles
+  const handleTap = (): void => {
+    if (controlsVisible) {
+      if (hideTimer.current) clearTimeout(hideTimer.current)
+      setControlsVisible(false)
+    } else {
+      showControls()
+    }
+  }
+
+  // Botões reiniciam o tempo para esconder e não repassam o toque para a tela
+  const action = (fn: () => void) => (e: React.MouseEvent): void => {
+    e.stopPropagation()
+    fn()
+    showControls()
+  }
+
+  const fade = controlsVisible ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'
+  const camTiles: Array<{ key: string; label: string; stream: MediaStream | null; color: string; mine: boolean }> = [
+    ...friendsInRoom.map((f) => ({
+      key: f,
+      label: f,
+      stream: remotes[f]?.cam || null,
+      color: USER_COLORS[f].hex,
+      mine: false
+    })),
+    { key: 'me', label: 'Você', stream: streamsRef.current.localCam, color: USER_COLORS[user].hex, mine: true }
+  ]
+
+  return (
+    <div className="fixed inset-0 bg-black z-50" onClick={handleTap}>
+      {screen ? (
+        <StreamVideo stream={screen} className="w-full h-full object-contain" />
+      ) : (
+        // Sem compartilhamento de tela: as câmeras dos amigos ocupam a tela toda
+        <div className={`w-full h-full grid gap-1 ${friendsInRoom.length > 1 ? 'grid-cols-2' : 'grid-cols-1'}`}>
+          {friendsInRoom.length === 0 ? (
+            <div className="flex items-center justify-center text-slate-300 text-sm font-semibold">
+              Assim que alguém entrar na Sala, a câmera aparece aqui.
+            </div>
+          ) : (
+            friendsInRoom.map((f) => (
+              <div key={f} className="relative bg-black">
+                <StreamVideo stream={remotes[f]?.cam || null} className="w-full h-full object-contain" />
+                <span className="absolute bottom-3 left-3 px-2 py-0.5 rounded bg-black/60 text-white text-xs font-bold">{f}</span>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+
+      {/* Câmeras pequenas no canto (só sobre a tela compartilhada; podem ser escondidas) */}
+      {screen && camsVisible && (
+        <div className="absolute top-3 right-3 flex flex-col gap-2 w-[min(20vw,220px)] min-w-[120px]">
+          {camTiles.map((tile) => (
+            <div
+              key={tile.key}
+              className="relative aspect-video rounded-lg overflow-hidden bg-black border-2 shadow-xl"
+              style={{ borderColor: tile.color }}
+            >
+              <StreamVideo
+                stream={tile.stream}
+                className={`w-full h-full ${tile.mine ? 'object-cover' : 'object-contain'}`}
+                mirrored={tile.mine}
+              />
+              <span className="absolute bottom-1 left-1.5 px-1.5 rounded bg-black/60 text-white text-[10px] font-bold">
+                {tile.label}
+              </span>
+              {tile.mine && !props.isCamEnabled && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/80 text-white text-[10px] font-bold">
+                  Câmera desligada
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {(callHealth === 'degraded' || callHealth === 'recovering') && (
+        <div className="absolute top-3 left-3 px-3 py-1.5 rounded-xl bg-amber-500/95 text-slate-950 text-xs font-bold shadow-xl">
+          {callHealth === 'recovering' ? '⚠️ Reconectando...' : '⚠️ Conexão instável...'}
+        </div>
+      )}
+
+      {/* Controles (somem sozinhos; um toque na tela traz de volta) */}
+      {screen && (
+        <div
+          className={`absolute left-3 transition-opacity duration-300 ${fade} ${
+            callHealth === 'degraded' || callHealth === 'recovering' ? 'top-14' : 'top-3'
+          }`}
+        >
+          <span className="px-3 py-1.5 rounded-xl bg-black/60 text-white text-sm font-bold">
+            🖥️ Tela de {remoteScreenSharer}
+          </span>
+        </div>
+      )}
+      <div
+        className={`absolute bottom-0 inset-x-0 flex items-center justify-center gap-3 px-4 pt-10 pb-[max(1rem,env(safe-area-inset-bottom))] bg-gradient-to-t from-black/80 to-transparent transition-opacity duration-300 ${fade}`}
+      >
+        {screen && (
+          <button
+            type="button"
+            onClick={action(() => setCamsVisible((v) => !v))}
+            className="px-4 py-3 rounded-2xl border bg-slate-800/90 border-slate-600 text-white text-sm font-bold flex items-center gap-2"
+          >
+            {camsVisible ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+            {camsVisible ? 'Esconder câmeras' : 'Mostrar câmeras'}
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={action(props.onToggleMic)}
+          className={`p-3.5 rounded-2xl border text-white ${props.isMicMuted ? 'bg-red-600 border-red-400' : 'bg-slate-800/90 border-slate-600'}`}
+          title="Mutar / desmutar microfone"
+        >
+          {props.isMicMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+        </button>
+        <button
+          type="button"
+          onClick={action(props.onToggleFullscreen)}
+          className="px-4 py-3 rounded-2xl border bg-slate-800/90 border-slate-600 text-white text-sm font-bold flex items-center gap-2"
+        >
+          <Minimize2 className="w-5 h-5" />
+          Sair da tela cheia
+        </button>
+        <button
+          type="button"
+          onClick={action(props.onLeave)}
+          className="p-3.5 rounded-2xl bg-red-600 border border-red-400 text-white"
+          title="Sair da sala"
+        >
+          <PhoneOff className="w-5 h-5" />
         </button>
       </div>
     </div>

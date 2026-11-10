@@ -66,6 +66,7 @@ export class MsnWebRTCService {
   private rawScreenStream: MediaStream | null = null
   private screenAudio: ScreenAudioCapture
 
+  private lastFriendsInRoomCount = -1
   private visibilityHandler: (() => void) | null = null
   private onlineHandler: (() => void) | null = null
 
@@ -947,11 +948,22 @@ export class MsnWebRTCService {
     })
   }
 
+  friendsInRoomCount(): number {
+    return this.allLinks().filter((l) => l.friendInRoom).length
+  }
+
   emitCallState(): void {
     const links = this.allLinks()
     const friendsInRoom = links
       .filter((l) => l.friendInRoom || l.hasLiveRemoteMedia)
       .map((l) => l.friend)
+
+    // Quantidade de amigos na sala mudou: reajusta o teto de bitrate das câmeras (malha)
+    const roomCount = this.friendsInRoomCount()
+    if (roomCount !== this.lastFriendsInRoomCount) {
+      this.lastFriendsInRoomCount = roomCount
+      links.forEach((l) => l.applySenderEncodings().catch(() => {}))
+    }
     const sharer = links.find((l) => l.isRemoteScreenSharing)
 
     // Saúde da ligação = pior estado entre os amigos que estão comigo na sala

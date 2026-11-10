@@ -912,20 +912,51 @@ export class PeerLink {
     }
   }
 
-  /** Configura 10 Mbps / 60 fps no sender da tela compartilhada. */
-  async applyScreenSenderParameters(screenVideoTrack: MediaStreamTrack): Promise<void> {
+  /**
+   * Teto de bitrate por tipo de mídia (o controle de congestionamento do WebRTC baixa abaixo disso
+   * quando a rede aperta). Só é aplicado depois da negociação, quando o sender já tem encodings.
+   */
+  async applySenderEncodings(): Promise<void> {
     const pc = this.peerConnection
     if (!pc) return
+    const micId = this.host.localMicStream?.getAudioTracks()[0]?.id
+    const camId = this.host.localCamStream?.getVideoTracks()[0]?.id
+    const screen = this.host.localScreenStream
+    const screenVideoId = screen?.getVideoTracks()[0]?.id
+    const screenAudioId = screen?.getAudioTracks()[0]?.id
+    // Com dois amigos na sala cada câmera é enviada duas vezes (malha): teto menor por conexão
+    const camMaxBitrate = this.host.friendsInRoomCount() > 1 ? 1_000_000 : 1_500_000
+
     for (const sender of pc.getSenders()) {
-      if (sender.track && sender.track.id === screenVideoTrack.id) {
-        const params = sender.getParameters()
-        if (!params.encodings || params.encodings.length === 0) {
-          params.encodings = [{}]
-        }
-        params.encodings[0].maxBitrate = 10_000_000
-        params.encodings[0].maxFramerate = 60
-        await sender.setParameters(params).catch(() => {})
+      const id = sender.track?.id
+      if (!id) continue
+      let maxBitrate: number | undefined
+      let maxFramerate: number | undefined
+      if (id === micId) {
+        maxBitrate = 64_000
+      } else if (id === camId) {
+        maxBitrate = camMaxBitrate
+        maxFramerate = 30
+      } else if (id === screenVideoId) {
+        maxBitrate = 8_000_000
+        maxFramerate = 60
+      } else if (id === screenAudioId) {
+        maxBitrate = 256_000
+      } else {
+        continue
       }
+
+      const params = sender.getParameters()
+      const encoding = params.encodings?.[0]
+      if (!encoding) continue // ainda não negociado: aplicado após a próxima negociação
+      if (encoding.maxBitrate === maxBitrate && (maxFramerate === undefined || encoding.maxFramerate === maxFramerate)) {
+        continue
+      }
+      encoding.maxBitrate = maxBitrate
+      if (maxFramerate !== undefined) encoding.maxFramerate = maxFramerate
+      await sender.setParameters(params).catch((err) => {
+        console.warn('[WebRTC] Falha ao aplicar limite de bitrate:', err)
+      })
     }
   }
 
@@ -933,10 +964,6 @@ export class PeerLink {
     if (!this.isFriendOnline && !this.peerConnection) return
     const pc = this.ensurePeerConnection()
     this.attachLocalStreamsToPeer(pc)
-    const screenVideoTrack = screenStream.getVideoTracks()[0]
-    if (screenVideoTrack) {
-      await this.applyScreenSenderParameters(screenVideoTrack)
-    }
     this.sendDataChannelPacket({
       type: 'screen-share-state',
       sender: this.myUser,
@@ -1084,9 +1111,10 @@ export class PeerLink {
             if (foundVoiceInbound && currentAudioBytes > 0) {
               if (currentAudioBytes === this.lastAudioBytesReceived) {
                 this.lastAudioBytesStallCount++
-                if (this.lastAudioBytesStallCount >= 2) {
+                // 3 checagens (9s): picos curtos de perda não disparam reconexão à toa
+                if (this.lastAudioBytesStallCount >= 3) {
                   console.warn(
-                    `[WebRTC] Voz de ${this.friend} estagnada há mais de 6s. Acionando reconexão preventiva...`
+                    `[WebRTC] Voz de ${this.friend} estagnada há mais de 9s. Acionando reconexão preventiva...`
                   )
                   this.lastAudioBytesStallCount = 0
                   this.callHealth = 'degraded'
@@ -1407,6 +1435,7 @@ export class PeerLink {
 
       const answer = await pc.createAnswer()
       await this.setLocalDescriptionSafe(pc, answer)
+      this.applySenderEncodings().catch(() => {})
       this.broadcastStreamMeta()
       await this.sendSignal('sdp-answer', {
         sdp: pc.localDescription,
@@ -1435,6 +1464,7 @@ export class PeerLink {
           this.remotePcId = senderPcId
         }
         await this.flushPendingIceCandidates(pc)
+        this.applySenderEncodings().catch(() => {})
         this.syncRemoteStreamsFromReceivers()
         this.emitStreamsUpdated()
         this.emitCallState()
@@ -2118,24 +2148,17 @@ export function mungeSdpForHardwareH264AndOpus(sdp: string): string {
       inVideoSection = false
     }
 
-    // Na seção de vídeo, adiciona b=AS:10000 logo APÓS a linha c=IN (respeitando RFC 4566)
-    if (inVideoSection && line.startsWith('c=IN ')) {
-      outputLines.push(line)
-      outputLines.push('b=AS:10000')
-      continue
-    }
-
-    // Configura Opus Stereo 510 kbps CBR para o áudio do filme/sistema
+    // Opus: permite estéreo de alta qualidade (áudio do filme) com FEC contra perda de pacotes.
+    // VBR (sem cbr=1): o bitrate real de cada trilha é limitado no sender (voz 64 kbps, filme 256 kbps).
+    // Antes era CBR a 510 kbps em TODA trilha de áudio, inclusive a voz.
     if (opusPt && line.startsWith(`a=fmtp:${opusPt} `)) {
-      line = `a=fmtp:${opusPt} minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=510000;cbr=1`
+      line = `a=fmtp:${opusPt} minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=510000`
     }
 
-    // Injeta parâmetros de bitrate alto nas linhas fmtp do H.264
-    if (inVideoSection && h264PayloadTypes.some((pt) => line.startsWith(`a=fmtp:${pt} `))) {
-      if (!line.includes('x-google-max-bitrate')) {
-        line = `${line};x-google-max-bitrate=10000;x-google-min-bitrate=2500;x-google-start-bitrate=6000`
-      }
-    }
+    // Vídeo: SEM bitrate mínimo/inicial forçado. Antes toda câmera tinha mínimo de 2,5 Mbps (início
+    // em 6 Mbps): numa ligação a três isso passava de 6 Mbps de upload constante por pessoa, sem poder
+    // baixar quando a rede apertava — congestionamento, perda de pacotes e imagem/voz engasgando.
+    // Os tetos por tipo de mídia ficam em applySenderEncodings().
 
     outputLines.push(line)
   }
